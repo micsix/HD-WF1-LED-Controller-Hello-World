@@ -1,0 +1,4 @@
+dependencies:
+  esphome/esp-hub75: "^0.3.6"
+  esp32-hub75-matrixpanel-dma:
+    git: https://github.com/mrcodetastic/ESP32-HUB75-MatrixPanel-DMA.git

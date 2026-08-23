@@ -1,0 +1,21 @@
+# HD-WF1 = ESP32-S2, 4MB flash, no PSRAM
+CONFIG_IDF_TARGET="esp32s2"
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_SPIRAM=n
+
+# Currently on mrcodetastic's ESP32-HUB75-MatrixPanel-DMA, proven-working on
+# this exact board, unlike the newer esphome/esp-hub75 native driver which
+# reports success but produces no visible output. Built with
+# ESP32_HUB75_USE_GFX=n below, so no Arduino/Adafruit-GFX dependency needed -
+# fillScreen/drawPixel/color565 etc. are available on MatrixPanel_I2S_DMA
+# either way.
+CONFIG_HUB75_BACKEND_ARDUINO_GFX=y
+CONFIG_HUB75_BACKEND_NATIVE=n
+CONFIG_ESP32_HUB75_USE_GFX=n
+
+# The HUB75 DMA driver benefits from a decently sized main task stack
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# ESP32-S2 has no USB_SERIAL_JTAG peripheral, so route the console through
+# the ROM's USB-CDC driver instead (same USB-A port used for flashing).
+CONFIG_ESP_CONSOLE_USB_CDC=y

@@ -1,0 +1,20 @@
+menu "HUB75 Hello World"
+
+    choice HUB75_BACKEND
+        prompt "Text rendering backend"
+        default HUB75_BACKEND_NATIVE
+        help
+            Selects which source file main/CMakeLists.txt compiles.
+
+        config HUB75_BACKEND_NATIVE
+            bool "Native ESP-IDF (esphome/esp-hub75 + built-in 5x7 font, no Arduino)"
+
+        config HUB75_BACKEND_ARDUINO_GFX
+            bool "Arduino + Adafruit-GFX (ESP32-HUB75-MatrixPanel-DMA)"
+            help
+                Requires re-adding espressif/arduino-esp32 and
+                mrcodetastic/ESP32-HUB75-MatrixPanel-DMA to main/idf_component.yml
+                (removed by default to keep the native build dependency-free).
+    endchoice
+
+endmenu
