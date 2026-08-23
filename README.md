@@ -1,5 +1,12 @@
 # HD-WF1 HUB75 "Hello, world!"
 
+### Hardware used for this project:
+
+https://www.aliexpress.us/item/2255801119828944.html
+
+https://www.aliexpress.us/item/2255799816372142.html
+
+
 ESP-IDF firmware that scrolls "Hello, world!" across a HUB75 RGB LED matrix
 panel connected to a **Huidu HD-WF1** control card (ESP32-S2, 4MB flash, no
 PSRAM, single HUB75E port).
