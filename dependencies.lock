@@ -23,6 +23,26 @@ dependencies:
     - esp32c6
     - esp32p4
     version: 0.3.6
+  espressif/cjson:
+    component_hash: e788323270d90738662d66fffa910bfe1fba019bba087f01557e70c40485b469
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.7.19~2
+  espressif/mqtt:
+    component_hash: fb18bc3b65aa8c94693a9811ffc322cca8a65d92d5ec84983d3e385080e3969c
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.3'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.1.0
   idf:
     source:
       type: idf
@@ -30,6 +50,8 @@ dependencies:
 direct_dependencies:
 - esp32-hub75-matrixpanel-dma
 - esphome/esp-hub75
-manifest_hash: 74cbac87063083a1726c9652f152c344b5fb31c44462b2f510936894f8c557b7
+- espressif/cjson
+- espressif/mqtt
+manifest_hash: 2cec14c27eb1b603600e4a060dcb25a940f8467002eed2b8269898dfb11bbb2b
 target: esp32s2
 version: 3.0.0

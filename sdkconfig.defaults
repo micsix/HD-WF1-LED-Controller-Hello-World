@@ -13,9 +13,53 @@ CONFIG_HUB75_BACKEND_ARDUINO_GFX=y
 CONFIG_HUB75_BACKEND_NATIVE=n
 CONFIG_ESP32_HUB75_USE_GFX=n
 
-# The HUB75 DMA driver benefits from a decently sized main task stack
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+# The HUB75 DMA driver benefits from a decently sized main task stack -
+# bumped from 8192 after adding hub75/maze4 and hub75/maze5 (extra maze
+# state + a diagonal-carving generator's locals) pushed app_main()'s single
+# giant stack frame (every feature's state lives there, all coexisting for
+# the program's lifetime) far enough to overflow the old size and panic
+# (RR=4) as soon as the render loop's next deep call - clearScreen() -
+# touched the corrupted region.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=10240
+
+# 4MB flash with a 1MB app partition (see partitions.csv) fills up fast as
+# features accrete in main.cpp - build for size (-Os) instead of the default
+# debug build (-Og), which buys back a meaningful chunk of flash headroom at
+# no behavior cost.
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
 
 # ESP32-S2 has no USB_SERIAL_JTAG peripheral, so route the console through
 # the ROM's USB-CDC driver instead (same USB-A port used for flashing).
 CONFIG_ESP_CONSOLE_USB_CDC=y
+
+# Flash-based core dump: persists a crash backtrace to a dedicated flash
+# partition regardless of whether the USB-CDC console is reachable at the
+# moment of the crash - read it back later with 'idf.py coredump-info',
+# which only needs the bootloader connection, not a live console.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
+CONFIG_ESP_COREDUMP_CHECK_BOOT=y
+
+# hub75/clock + hub75/ntpset support up to two configured NTP servers
+CONFIG_LWIP_SNTP_MAX_SERVERS=2
+# Periodic background resync every 5 minutes (lwip's built-in SNTP periodic
+# mode, started automatically by esp_netif_sntp_init()'s default config.start
+# = true) - each resync re-fires ntp_sync_cb(), so the "TIME SET" confirmation
+# reappears every 5 minutes too, not just on the initial sync/hub75/ntpset.
+CONFIG_LWIP_SNTP_UPDATE_DELAY=300000
+
+# Console on UART, not the ROM USB CDC: at 128x64 the display DMA setup
+# coincides with a crash in esp_usb_console_interrupt (ROM USB ISR), which
+# reboot-loops the board. See README "128x64 bring-up" notes.
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_ESP_CONSOLE_USB_CDC=n
+
+# Trim WiFi buffers: 128x64 @ 8-bit takes ~64KB of the ~139KB free heap, and
+# esp_wifi_init() otherwise fails with ESP_ERR_NO_MEM (rc=257). MQTT + tiny
+# pings need no throughput, so smaller buffers / no AMPDU are fine.
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=6
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=n
+CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=n
