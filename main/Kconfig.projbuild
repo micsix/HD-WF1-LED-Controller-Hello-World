@@ -2,19 +2,205 @@ menu "HUB75 Hello World"
 
     choice HUB75_BACKEND
         prompt "Text rendering backend"
-        default HUB75_BACKEND_NATIVE
+        default HUB75_BACKEND_ARDUINO_GFX
         help
             Selects which source file main/CMakeLists.txt compiles.
 
         config HUB75_BACKEND_NATIVE
             bool "Native ESP-IDF (esphome/esp-hub75 + built-in 5x7 font, no Arduino)"
+            help
+                Dead end kept for reference: this library initializes but
+                produces zero physical output on this board (see RootCause.md).
 
         config HUB75_BACKEND_ARDUINO_GFX
             bool "Arduino + Adafruit-GFX (ESP32-HUB75-MatrixPanel-DMA)"
             help
-                Requires re-adding espressif/arduino-esp32 and
-                mrcodetastic/ESP32-HUB75-MatrixPanel-DMA to main/idf_component.yml
-                (removed by default to keep the native build dependency-free).
+                The active, working backend - built with ESP32_HUB75_USE_GFX=n
+                so no actual Arduino/Adafruit-GFX dependency is pulled in.
     endchoice
+
+endmenu
+
+menu "HD-WF1 WiFi"
+
+    config WIFI_SSID
+        string "WiFi SSID"
+        default ""
+        help
+            SSID of the 2.4 GHz network to connect to. Leave empty to skip
+            WiFi entirely. Set via 'idf.py menuconfig' - this is stored only
+            in sdkconfig (gitignored), never committed.
+
+    config WIFI_PASSWORD
+        string "WiFi password"
+        default ""
+        help
+            Set via 'idf.py menuconfig' - stored only in sdkconfig
+            (gitignored), never committed to git.
+
+endmenu
+
+menu "HD-WF1 REST API"
+
+    config HTTP_API_ENABLE
+        bool "Enable REST API"
+        default y
+        help
+            HTTP control API, equivalent to the MQTT topics:
+            POST /api/command/<name> (body = MQTT payload) and
+            GET /api/status. Starts after WiFi connects. Costs a few KB
+            of heap (httpd task + sockets) - disable if the lean build
+            runs short of memory.
+
+    config HTTP_API_PORT
+        int "REST API port"
+        default 80
+        depends on HTTP_API_ENABLE
+
+    config HTTP_API_TOKEN
+        string "REST API bearer token"
+        default ""
+        depends on HTTP_API_ENABLE
+        help
+            If non-empty, requests must send "Authorization: Bearer <token>".
+            Empty = no authentication (anyone on the LAN can control the
+            panel). Set via 'idf.py menuconfig' - stored only in sdkconfig.
+
+endmenu
+
+menu "HD-WF1 MQTT"
+
+    config MQTT_BROKER_URI
+        string "MQTT broker URI"
+        default ""
+        help
+            e.g. mqtt://broker.example.com:1883 or mqtts://broker.example.com:8883.
+            Leave empty to skip MQTT entirely (also requires WiFi to be
+            configured - see 'HD-WF1 WiFi' above). Set via
+            'idf.py menuconfig' - stored only in sdkconfig (gitignored),
+            never committed to git.
+
+    config MQTT_CLIENT_ID
+        string "MQTT client ID"
+        default "hd-wf1-hub75"
+
+    config MQTT_USERNAME
+        string "MQTT username"
+        default ""
+        help
+            Leave empty if the broker doesn't require authentication.
+
+    config MQTT_PASSWORD
+        string "MQTT password"
+        default ""
+        help
+            Set via 'idf.py menuconfig' - stored only in sdkconfig
+            (gitignored), never committed to git.
+
+    config MQTT_STATUS_TOPIC
+        string "MQTT status topic"
+        default "hub75/status"
+        help
+            Retained "online"/"offline" (LWT) messages are published here.
+
+    config MQTT_MESSAGE_TOPIC
+        string "MQTT message topic"
+        default "hub75/message"
+        help
+            Subscribed on connect. Payload is JSON:
+            {"text": "Hello!", "color": "#RRGGBB"} - "color" is optional
+            and defaults to green if omitted.
+
+endmenu
+
+menu "HD-WF1 Ping"
+
+    config PING_TARGETS
+        string "Ping targets"
+        default "192.168.92.1"
+        help
+            Comma-separated list of up to 8 targets pinged by hub75/ping1
+            and hub75/ping2. Each entry is HOST or HOST:PORT - HOST is a
+            literal IPv4 address or a hostname (resolved via DNS at ping
+            time), PORT is optional and only used when 'Ping method' below
+            is TCP connect (falls back to 'Default TCP ping port' if
+            omitted). Example: "192.168.92.1,example.com:8080,10.0.0.5:22".
+            Every ping (each hub75/ping1/ping2 sample) picks one target at
+            random from this list - a random round-robin across all of
+            them, not a fixed sequence. Set via 'idf.py menuconfig'.
+
+    choice PING_METHOD
+        prompt "Ping method"
+        default PING_METHOD_ICMP
+        help
+            How hub75/ping1 and hub75/ping2 measure latency to whichever
+            target above was picked for that sample.
+
+        config PING_METHOD_ICMP
+            bool "ICMP echo (standard ping)"
+            help
+                A normal ICMP echo request/reply, timed round-trip. Many
+                hosts and firewalls silently drop these, which reads as a
+                permanent timeout.
+
+        config PING_METHOD_TCP
+            bool "TCP connect (tcpping)"
+            help
+                Times a TCP three-way handshake to the port below instead of
+                an ICMP echo - works through firewalls that block ICMP but
+                allow a specific TCP port. A closed port (connection refused)
+                counts the same as a timeout, so pick a port that's actually
+                open on the target.
+    endchoice
+
+    config PING_TARGET_TCP_PORT
+        int "Default TCP ping port"
+        default 80
+        range 1 65535
+        depends on PING_METHOD_TCP
+        help
+            Port used for any entry in 'Ping targets' above that doesn't
+            specify its own PORT. Only relevant when 'Ping method' is TCP
+            connect.
+
+endmenu
+
+menu "HD-WF1 NTP"
+
+    config NTP_SERVER1
+        string "Primary NTP server"
+        default "pool.ntp.org"
+        help
+            Used for hub75/ntpset and the initial time sync (requires WiFi -
+            see 'HD-WF1 WiFi' above).
+
+    config NTP_SERVER2
+        string "Secondary NTP server (optional)"
+        default ""
+        help
+            Leave empty to use only the primary server.
+
+endmenu
+
+menu "HD-WF1 Boot Splash"
+
+    comment "Up to 4 lines of text (e.g. owner contact info) shown yellow-on-black for 10s at boot."
+    comment "Keep the real values in sdkconfig (gitignored), not sdkconfig.defaults. All empty = no splash."
+
+    config SPLASH_LINE1
+        string "Splash line 1"
+        default ""
+
+    config SPLASH_LINE2
+        string "Splash line 2"
+        default ""
+
+    config SPLASH_LINE3
+        string "Splash line 3"
+        default ""
+
+    config SPLASH_LINE4
+        string "Splash line 4"
+        default ""
 
 endmenu
