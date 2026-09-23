@@ -21,6 +21,25 @@ menu "HUB75 Hello World"
 
 endmenu
 
+menu "HD-WF1 Panel"
+
+    choice PANEL_RESOLUTION
+        prompt "Panel resolution"
+        default PANEL_RESOLUTION_128X64
+        help
+            Which physical HUB75E panel is wired to this board. Fixed at
+            build time - there is no runtime switch; reflash after changing
+            this to drive the other panel.
+
+        config PANEL_RESOLUTION_128X64
+            bool "128x64"
+
+        config PANEL_RESOLUTION_64X32
+            bool "64x32"
+    endchoice
+
+endmenu
+
 menu "HD-WF1 WiFi"
 
     config WIFI_SSID
@@ -66,6 +85,22 @@ menu "HD-WF1 REST API"
             Empty = no authentication (anyone on the LAN can control the
             panel). Set via 'idf.py menuconfig' - stored only in sdkconfig.
 
+    config HTTP_API_MAC_PREFIX
+        bool "Prefix REST paths with this device's WiFi MAC"
+        default y
+        depends on HTTP_API_ENABLE
+        help
+            When enabled (default), routes become
+            POST /api/<mac>/command/<name> and GET /api/<mac>/status, where
+            <mac> is this device's WiFi station MAC as 12 lowercase hex
+            digits - the same device ID and format used for MQTT topics
+            when 'HD-WF1 MQTT' -> 'Prefix hub75/ topics with this device's
+            WiFi MAC' is also enabled, so scripts/tooling can derive both
+            from one ID. Independent of that MQTT setting - either can be on
+            or off regardless of the other. Disable for the legacy flat
+            /api/command/<name> and /api/status paths (fine for a single
+            board, or when a reverse proxy already routes per device).
+
 endmenu
 
 menu "HD-WF1 MQTT"
@@ -110,6 +145,23 @@ menu "HD-WF1 MQTT"
             Subscribed on connect. Payload is JSON:
             {"text": "Hello!", "color": "#RRGGBB"} - "color" is optional
             and defaults to green if omitted.
+
+    config MQTT_TOPIC_MAC_PREFIX
+        bool "Prefix hub75/ topics with this device's WiFi MAC"
+        default y
+        help
+            When enabled (default), every hub75/<topic> command is
+            subscribed/matched as hub75/<mac>/<topic> instead - where <mac>
+            is this device's WiFi station MAC as 12 lowercase hex digits,
+            e.g. hub75/a1b2c3d4e5f6/red - so multiple boards can share one
+            broker without colliding on the same topic names. The status
+            topic above and a message topic left at its "hub75/..." default
+            are namespaced the same way; a message topic customized to a
+            fully different (non-"hub75/"-prefixed) topic is never touched.
+            The REST API's own MAC prefix ('HD-WF1 REST API' ->
+            'Prefix REST paths with this device's WiFi MAC') is independent
+            of this setting. Disable for the legacy flat hub75/<topic>
+            scheme (fine for a single board on a broker).
 
 endmenu
 

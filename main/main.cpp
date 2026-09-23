@@ -22,6 +22,7 @@
 #include "driver/gpio.h"
 #include "esp_event.h"
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_netif_sntp.h"
 #include "esp_heap_caps.h"
@@ -40,6 +41,7 @@
 #include "lwip/netdb.h"
 #include "lwip/sockets.h"
 #include "mqtt_client.h"
+#include "nvs.h"
 #include "nvs_flash.h"
 #include "ping/ping_sock.h"
 
@@ -54,7 +56,7 @@
 #include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
 
 #include "font8x8_basic.h"
-#include "chilanka_1300.h"
+#include "chilanka_digits.h"
 
 static const char *TAG = "hub75_hello";
 static const char *WIFI_TAG = "hub75_wifi";
@@ -113,21 +115,36 @@ uint8_t clock_color_r = 255, clock_color_g = 255, clock_color_b = 255;
 // the hub75/red, hub75/green, hub75/blue, hub75/yellow, hub75/orange topics.
 uint8_t solid_r = 255, solid_g = 0, solid_b = 0;
 
-// hub75/1300L colours, set from its optional JSON payload (see set_fixed1300l())
-// - guarded by display_mutex like the rest. hue is a per-channel tint applied
-// to both fg and bg (#ffffff = none).
-uint8_t f1300l_fg[3] = {255, 255, 255}, f1300l_bg[3] = {0, 0, 0}, f1300l_hue[3] = {255, 255, 255};
+// hub75/nnL .. hub75/nnnnnnL (a 2-6 digit number): the digits and the colours
+// from the optional JSON payload (see set_number_l()) - guarded by
+// display_mutex like the rest. hue is a per-channel tint applied to both fg
+// and bg (#ffffff = none).
+constexpr int kNumberLMaxDigits = 6;
+char number_l_digits[kNumberLMaxDigits + 1] = "1300";
+uint8_t number_l_fg[3] = {255, 255, 255}, number_l_bg[3] = {0, 0, 0}, number_l_hue[3] = {255, 255, 255};
 
-// HUB75E panel geometry (single chain). Now 128x64 (1/32 scan, uses the E
-// address line) - was 64x32. Defined up here since state below is sized by it.
-#define PANEL_WIDTH  128
-#define PANEL_HEIGHT 64
-#define PANEL_CHAIN  1
+// HUB75E panel geometry (single chain). Two physical panels are supported -
+// the current 128x64 (1/32 scan, uses the E address line) and the original
+// 64x32 - chosen by a PanelProfile (see kProfile128x64/kProfile64x32 near
+// the WF1_*_PIN defines below); which one is active is a menuconfig choice
+// (CONFIG_PANEL_RESOLUTION_128X64/64X32, 'HD-WF1 Panel'), fixed at build
+// time and read once at boot in app_main() - there is no runtime switch.
+// PANEL_WIDTH/PANEL_HEIGHT hold whichever profile was selected and are set
+// once by init_display() at boot; kPanelMaxWidth/kPanelMaxHeight are fixed
+// compile-time bounds (the larger of the two profiles) used to size
+// fixed-capacity buffers/arrays that must accommodate either profile
+// regardless of which is active - state below sized by the panel is sized
+// off these, not off the live PANEL_WIDTH/PANEL_HEIGHT.
+constexpr int kPanelMaxWidth = 128;
+constexpr int kPanelMaxHeight = 64;
+int PANEL_WIDTH  = kPanelMaxWidth;
+int PANEL_HEIGHT = kPanelMaxHeight;
+constexpr int PANEL_CHAIN  = 1;
 
 // hub75/rainbow: one random color per panel row, generated fresh each time
 // the topic fires and held static (same style as kSolidColor) until
 // something else is displayed.
-uint8_t rainbow_row_r[PANEL_HEIGHT], rainbow_row_g[PANEL_HEIGHT], rainbow_row_b[PANEL_HEIGHT];
+uint8_t rainbow_row_r[kPanelMaxHeight], rainbow_row_g[kPanelMaxHeight], rainbow_row_b[kPanelMaxHeight];
 
 // hub75/matrix1/2/3(c): grids of randomly colored squares - one shared color
 // buffer sized for the largest grid (matrix3, 16 rows x 32 cols = 512
@@ -140,25 +157,15 @@ uint8_t matrix_cell_r[kMatrixMaxCells];
 uint8_t matrix_cell_g[kMatrixMaxCells];
 uint8_t matrix_cell_b[kMatrixMaxCells];
 
-// hub75/ray1 and hub75/ray2: colors for the random ray-traced scene(s)
-// (sphere(s) + checkerboard floor) - randomized fresh each time either topic
-// fires, same style as kRainbow above. ray_sphere_r/g/b is the first (and
-// for hub75/ray1, only) sphere; ray2_sphere2_r/g/b is hub75/ray2's second
-// sphere. See set_raytrace()/draw_raytracer().
-uint8_t ray_sphere_r = 200, ray_sphere_g = 60, ray_sphere_b = 60;
-uint8_t ray2_sphere2_r = 60, ray2_sphere2_g = 60, ray2_sphere2_b = 200;
-uint8_t ray_floor1_r = 90, ray_floor1_g = 90, ray_floor1_b = 90;
-uint8_t ray_floor2_r = 30, ray_floor2_g = 30, ray_floor2_b = 30;
-
 // Until the first MQTT message arrives, the panel shows live WiFi connection
 // status instead of display_text - see set_wifi_status_connecting()/
 // set_wifi_status_connected() and handle_message_payload()'s one-way
 // transition out of WifiStatus mode. kTest1/kTest2/kTest3 are diagnostic/fun
-// patterns, kSolidColor/kRainbow/kFlagUsa/kFlagCanada are simple fills, and
-// kAutoTest (hub75/0) cycles through all of the above in sequence forever -
-// all triggered by their respective hub75/* topics (see mqtt_event_handler)
-// and each running until another message arrives on any of these topics
-// (kAutoTest specifically runs until hub75/1).
+// patterns, kSolidColor/kRainbow are simple fills, and kAutoTest (hub75/0)
+// cycles through all of the above in sequence forever - all triggered by
+// their respective hub75/* topics (see mqtt_event_handler) and each running
+// until another message arrives on any of these topics (kAutoTest
+// specifically runs until hub75/1).
 enum class DisplayMode {
   kWifiStatus,
   kMessage,
@@ -167,8 +174,6 @@ enum class DisplayMode {
   kTest3,
   kSolidColor,
   kRainbow,
-  kFlagUsa,
-  kFlagCanada,
   kAutoTest,
   kElevator,
   kElevatorLarge,
@@ -176,11 +181,6 @@ enum class DisplayMode {
   kClock,
   kClockConfirm,
   kOff,
-  kRayTrace,
-  kRayTrace2,
-  kStandardTest1,
-  kSpaceInvaders,
-  kMillipede,
   kPong,
   kTicTacToe,
   kMatrix1,
@@ -189,7 +189,6 @@ enum class DisplayMode {
   kMatrix1Cont,
   kMatrix2Cont,
   kMatrix3Cont,
-  kBall1,
   kShootingStars,
   kTimeFrame,
   kMaze1,
@@ -209,7 +208,7 @@ enum class DisplayMode {
   kFixed00,
   kFixed1300E,
   kFixed1300F,
-  kFixed1300L,
+  kNumberL,
   kFixed1300LI
 };
 DisplayMode display_mode = DisplayMode::kWifiStatus;
@@ -272,6 +271,29 @@ EventGroupHandle_t wifi_event_group = nullptr;
 // "connected" pixel). Plain volatile bool: single writer (WiFi event handler).
 volatile bool wifi_link_up = false;
 int wifi_attempt_count = 0;
+// Set once by wifi_init() (esp_netif_create_default_wifi_sta()'s return
+// value) so the onboard button's long-press gateway ping (see
+// gateway_ping_task() below) can look up the current default gateway. Null
+// until/unless WiFi is configured (see wifi_init()'s early return).
+esp_netif_t *wifi_sta_netif = nullptr;
+
+// This device's WiFi station MAC as 12 lowercase hex digits (e.g.
+// "a1b2c3d4e5f6") - the device ID used to namespace MQTT topics
+// (CONFIG_MQTT_TOPIC_MAC_PREFIX, see mqtt_init()) and/or REST paths
+// (CONFIG_HTTP_API_MAC_PREFIX, see http_api_init()) so multiple boards can
+// share one broker/be scripted uniformly without colliding. Computed once
+// by compute_device_id(), called early in app_main() - esp_read_mac() works
+// before WiFi ever starts (it's derived arithmetically from the
+// efuse-burned base MAC, not read from the running driver), so this is
+// ready before mqtt_init()/http_api_init() need it.
+char device_id_hex[13] = "000000000000";
+
+void compute_device_id(void) {
+  uint8_t mac[6] = {0};
+  esp_read_mac(mac, ESP_MAC_WIFI_STA);
+  snprintf(device_id_hex, sizeof(device_id_hex), "%02x%02x%02x%02x%02x%02x", mac[0], mac[1], mac[2], mac[3], mac[4],
+           mac[5]);
+}
 
 // hub75/ping1: a scrolling latency graph (like a network monitor's ping
 // strip-chart) - one column per sample, oldest at index 0/left, newest at
@@ -280,8 +302,12 @@ int wifi_attempt_count = 0;
 // so the display itself is always smooth regardless of how slow or fast
 // the network actually is - only ping1_task() below ever waits on the
 // network. Protected by display_mutex like the other cross-task display
-// state above. kPing1GraphWidth matches PANEL_WIDTH - one sample column per pixel column.
-constexpr int kPing1GraphWidth = PANEL_WIDTH;
+// state above. The buffer is sized for the largest supported panel
+// (kPanelMaxWidth) so it doesn't need resizing when the panel profile
+// switches; only the most recent PANEL_WIDTH (live) columns are ever drawn -
+// see the kPing1 draw case in the render loop - so a narrower active panel
+// just shows the newest slice of an otherwise-unchanged scrolling history.
+constexpr int kPing1GraphWidth = kPanelMaxWidth;
 constexpr uint16_t kPing1Timeout = 0xffff;  // sentinel: this column's ping had no reply
 
 // Up to 8 ping targets (see CONFIG_PING_TARGETS, 'HD-WF1 Ping' in
@@ -700,6 +726,51 @@ void maze4_task(void *arg) {
   }
 }
 
+// Onboard button's long-press action (see the button handling in the render
+// loop) - unlike ping1/ping2/maze4 above, this always pings the current
+// default gateway (via wifi_sta_netif), not a CONFIG_PING_TARGETS entry,
+// since it's meant as a quick "is this thing on the network at all" check
+// that works even in the lean build. Runs as its own task (see "Cross-task
+// state" in CLAUDE.md) since an ICMP round-trip is network I/O that must
+// never block the render loop; the render loop's button code just gives
+// gateway_ping_trigger and otherwise mirrors gateway_ping_pixel_on onto the
+// lower-right pixel every tick while gateway_ping_active is true.
+volatile bool gateway_ping_active = false;    // true for the whole 5-ping sequence, incl. the final off-hold
+volatile bool gateway_ping_pixel_on = false;  // current blink phase
+SemaphoreHandle_t gateway_ping_trigger = nullptr;
+
+// Pings the default gateway kPingCount times, toggling gateway_ping_pixel_on
+// around each ping so the render loop blinks the lower-right pixel once per
+// packet, then leaves it off. No gateway (WiFi never configured/connected)
+// just means every ping times out - still blinks, just all "misses".
+void gateway_ping_task(void *arg) {
+  (void)arg;
+  constexpr uint32_t kPingTimeoutMs = 500;
+  constexpr int kPingCount = 5;
+  while (true) {
+    xSemaphoreTake(gateway_ping_trigger, portMAX_DELAY);
+
+    char gw_ip[16] = "0.0.0.0";  // "255.255.255.255" + NUL
+    esp_netif_ip_info_t ip_info = {};
+    if (wifi_sta_netif != nullptr && esp_netif_get_ip_info(wifi_sta_netif, &ip_info) == ESP_OK) {
+      snprintf(gw_ip, sizeof(gw_ip), IPSTR, IP2STR(&ip_info.gw));
+    }
+    ESP_LOGI(TAG, "button long-press: pinging default gateway %s", gw_ip);
+
+    gateway_ping_active = true;
+    for (int i = 0; i < kPingCount; i++) {
+      gateway_ping_pixel_on = true;
+      const double rtt_ms = ping_once_ms(gw_ip, kPingTimeoutMs);
+      gateway_ping_pixel_on = false;
+      ESP_LOGI(TAG, "gateway ping %d/%d: %.1f ms%s", i + 1, kPingCount, rtt_ms,
+                rtt_ms >= static_cast<double>(kPingTimeoutMs) ? " (timeout)" : "");
+      vTaskDelay(pdMS_TO_TICKS(150));  // gap between blinks
+    }
+    vTaskDelay(pdMS_TO_TICKS(200));  // hold the off state long enough for the render loop to draw it
+    gateway_ping_active = false;
+  }
+}
+
 // No-op once display_mode has already moved on to kMessage (first MQTT
 // message received) - WiFi status is only shown until then.
 void set_wifi_status_connecting(int attempt) {
@@ -733,7 +804,19 @@ void set_wifi_status_connected(const esp_ip4_addr_t &ip) {
     status_lines[1].r = 255;
     status_lines[1].g = 255;
     status_lines[1].b = 0;
+    // Reflects CONFIG_MQTT_TOPIC_MAC_PREFIX directly (device_id_hex is ready
+    // long before this fires - see compute_device_id() in app_main()) rather
+    // than reading mqtt_topic_ns, which mqtt_init() doesn't populate until
+    // after WiFi connects and would still read the pre-MAC-prefix default
+    // the first time this runs. NOTE: at 4px/char (kSmallFontAdvance) this
+    // line is 26 chars/104px - fits the 128-wide panel with room to spare,
+    // but overflows the 64-wide profile (already a tight fit even before
+    // this feature, at 13 chars/52px for "Topic: hub75/" alone).
+#if CONFIG_MQTT_TOPIC_MAC_PREFIX
+    snprintf(status_lines[2].text, kMaxStatusLineLen, "Topic: hub75/%s/", device_id_hex);
+#else
     strlcpy(status_lines[2].text, "Topic: hub75/", kMaxStatusLineLen);
+#endif
     status_lines[2].r = 255;
     status_lines[2].g = 255;
     status_lines[2].b = 255;
@@ -799,7 +882,7 @@ void wifi_init(void) {
 
   ESP_ERROR_CHECK(esp_netif_init());
   ESP_ERROR_CHECK(esp_event_loop_create_default());
-  esp_netif_create_default_wifi_sta();
+  wifi_sta_netif = esp_netif_create_default_wifi_sta();
 
   wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
   ESP_ERROR_CHECK(esp_wifi_init(&cfg));
@@ -894,23 +977,6 @@ constexpr const char *kOrangeTopic = "hub75/orange";
 constexpr const char *kWhiteTopic = "hub75/white";
 constexpr const char *kBlackTopic = "hub75/black";
 
-// hub75/standardtest1: fixed, repeatable white/red/green/blue x dim/bright
-// sequence for comparing color/brightness behavior across firmware changes -
-// see the kStandardTest1 render-loop case. Always restarts at phase 0 on
-// activation. Advances automatically (~2s/phase) and can also be advanced
-// manually with the onboard button (WF1_BUTTON_PIN) while active - see the
-// button handling in the render loop.
-constexpr const char *kStandardTest1Topic = "hub75/standardtest1";
-
-// hub75/si, hub75/mi: self-playing, stylized arcade demos - see
-// run_space_invaders_frame()/run_millipede_frame() in app_main().
-// Landscape-oriented: the 64px axis is the wide play-field direction
-// (player sweep, enemy formation width), the 32px axis is the short
-// advance-toward-player direction, matching the panel's physical
-// orientation.
-constexpr const char *kSpaceInvadersTopic = "hub75/si";
-constexpr const char *kMillipedeTopic = "hub75/mi";
-
 // hub75/pong: self-playing Pong with a seven-segment scoreboard - see
 // run_pong_frame() and draw_pong_score()/draw_seven_seg_digit() above.
 constexpr const char *kPongTopic = "hub75/pong";
@@ -938,10 +1004,6 @@ constexpr const char *kMatrix3ContTopic = "hub75/matrix3c";
 // randomly-shimmering small-font glyphs with a bright head and a fading
 // green tail - see run_matrix_rain_frame().
 constexpr const char *kMatrixRainTopic = "hub75/matrix";
-
-// hub75/ball1: a filled 8x8 ball bouncing around the panel, picking a fresh
-// random color each time it hits a wall - see run_ball1_frame().
-constexpr const char *kBall1Topic = "hub75/ball1";
 
 // hub75/shootingstars: 3 bouncing 2x2 "stars" (red/blue/white), each trailing
 // a fading tail up to 6px long pointing back along its direction of travel -
@@ -985,11 +1047,6 @@ constexpr const char *kPing1Topic = "hub75/ping1";
 // out, if the ping timed out) once per ping - see ping2_task() and
 // DisplayMode::kPing2 in the render loop's switch.
 constexpr const char *kPing2Topic = "hub75/ping2";
-
-// Flags - simplified/stylized pixel art given the 64x32 resolution, drawn in
-// the render loop (search for DisplayMode::kFlagUsa etc.).
-constexpr const char *kFlagUsaTopic = "hub75/flag";
-constexpr const char *kFlagCanadaTopic = "hub75/canada";
 
 // Blink overlay toggle - see blink_enabled. hub75/flash toggles on/off;
 // hub75/noflash always turns it off regardless of current state.
@@ -1044,13 +1101,7 @@ constexpr const char *kFixed00Topic = "hub75/00";
 // around as its own pair of topics.
 constexpr const char *kFixed1300ETopic = "hub75/1300e";
 constexpr const char *kFixed1300FTopic = "hub75/1300f";
-constexpr const char *kFixed1300LTopic = "hub75/1300L";
 constexpr const char *kFixed1300LITopic = "hub75/1300LI";
-
-// hub75/ray1: random ray-traced scene - see draw_raytracer()/set_raytrace().
-constexpr const char *kRay1Topic = "hub75/ray1";
-// hub75/ray2: same, but with a second sphere - see set_raytrace2().
-constexpr const char *kRay2Topic = "hub75/ray2";
 
 // hub75/0 cycles through every display pattern in sequence, forever, until
 // hub75/1 stops it (reverting to kMessage) - see the kAutoTest phase table
@@ -1096,18 +1147,38 @@ void set_test_mode(DisplayMode mode, const char *name) {
   ESP_LOGI(MQTT_TAG, "switched to %s", name);
 }
 
-// hub75/1300L. Payload is optional JSON {"fg":"#RRGGBB","bg":"#RRGGBB",
+// If `topic` is "hub75/<n>" or "hub75/<n>L" with n a run of 2-6 digits, copies
+// the digits (NUL-terminated) into `digits` and returns true. The legacy exact
+// topics hub75/1300, hub75/13 and hub75/00 are matched earlier in
+// dispatch_command() and keep their original small static look.
+bool parse_number_topic(const char *topic, int topic_len, char *digits) {
+  static const char kPrefix[] = "hub75/";
+  const int plen = static_cast<int>(sizeof(kPrefix)) - 1;
+  if (topic_len < plen + 2 || strncmp(topic, kPrefix, plen) != 0) return false;
+  int n = topic_len - plen;
+  if (topic[topic_len - 1] == 'L') n--;
+  if (n < 2 || n > kNumberLMaxDigits) return false;
+  for (int i = 0; i < n; i++) {
+    if (topic[plen + i] < '0' || topic[plen + i] > '9') return false;
+    digits[i] = topic[plen + i];
+  }
+  digits[n] = '\0';
+  return true;
+}
+
+// hub75/nn .. hub75/nnnnnn (optional trailing L): the number `digits` in the Chilanka font,
+// stretched to fill the panel (see draw_chilanka_number()). Payload is optional JSON {"fg":"#RRGGBB","bg":"#RRGGBB",
 // "hue":"#RRGGBB"}: fg = digit colour (default white), bg = background
 // (default black), hue = a tint multiplied into both (default #ffffff, i.e.
 // none - e.g. "#ffd080" pulls the blue down to compensate a blue-heavy
 // panel). Any missing/invalid field keeps its default; an empty or
 // non-JSON payload gives plain white on black.
-void set_fixed1300l(const char *data, int data_len) {
+void set_number_l(const char *data, int data_len, const char *digits) {
   uint8_t fg[3] = {255, 255, 255}, bg[3] = {0, 0, 0}, hue[3] = {255, 255, 255};
   if (data != nullptr && data_len > 0) {
     cJSON *root = cJSON_ParseWithLength(data, data_len);
     if (root == nullptr) {
-      ESP_LOGW(MQTT_TAG, "1300L: payload is not valid JSON, using defaults");
+      ESP_LOGW(MQTT_TAG, "%sL: payload is not valid JSON, using defaults", digits);
     } else {
       const struct {
         const char *key;
@@ -1117,19 +1188,20 @@ void set_fixed1300l(const char *data, int data_len) {
         const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, f.key);
         if (item == nullptr) continue;
         if (!cJSON_IsString(item) || !parse_hex_color(item->valuestring, &f.dst[0], &f.dst[1], &f.dst[2])) {
-          ESP_LOGW(MQTT_TAG, "1300L: invalid \"%s\" (want \"#RRGGBB\"), using default", f.key);
+          ESP_LOGW(MQTT_TAG, "%sL: invalid \"%s\" (want \"#RRGGBB\"), using default", digits, f.key);
         }
       }
       cJSON_Delete(root);
     }
   }
   xSemaphoreTake(display_mutex, portMAX_DELAY);
-  memcpy(f1300l_fg, fg, 3);
-  memcpy(f1300l_bg, bg, 3);
-  memcpy(f1300l_hue, hue, 3);
-  display_mode = DisplayMode::kFixed1300L;
+  strlcpy(number_l_digits, digits, sizeof(number_l_digits));
+  memcpy(number_l_fg, fg, 3);
+  memcpy(number_l_bg, bg, 3);
+  memcpy(number_l_hue, hue, 3);
+  display_mode = DisplayMode::kNumberL;
   xSemaphoreGive(display_mutex);
-  ESP_LOGI(MQTT_TAG, "1300L fg=#%02X%02X%02X bg=#%02X%02X%02X hue=#%02X%02X%02X", fg[0], fg[1], fg[2], bg[0], bg[1],
+  ESP_LOGI(MQTT_TAG, "%sL fg=#%02X%02X%02X bg=#%02X%02X%02X hue=#%02X%02X%02X", digits, fg[0], fg[1], fg[2], bg[0], bg[1],
            bg[2], hue[0], hue[1], hue[2]);
 }
 
@@ -1210,37 +1282,13 @@ void set_matrix(DisplayMode mode, int cell_count, const char *name) {
   ESP_LOGI(MQTT_TAG, "switched to %s", name);
 }
 
-void set_raytrace() {
-  xSemaphoreTake(display_mutex, portMAX_DELAY);
-  random_color(&ray_sphere_r, &ray_sphere_g, &ray_sphere_b, 80, 176);
-  random_color(&ray_floor1_r, &ray_floor1_g, &ray_floor1_b, 40, 120);
-  ray_floor2_r = static_cast<uint8_t>(ray_floor1_r / 3);
-  ray_floor2_g = static_cast<uint8_t>(ray_floor1_g / 3);
-  ray_floor2_b = static_cast<uint8_t>(ray_floor1_b / 3);
-  display_mode = DisplayMode::kRayTrace;
-  xSemaphoreGive(display_mutex);
-  ESP_LOGI(MQTT_TAG, "ray tracer (random scene)");
-}
-
-void set_raytrace2() {
-  xSemaphoreTake(display_mutex, portMAX_DELAY);
-  random_color(&ray_sphere_r, &ray_sphere_g, &ray_sphere_b, 80, 176);
-  random_color(&ray2_sphere2_r, &ray2_sphere2_g, &ray2_sphere2_b, 80, 176);
-  random_color(&ray_floor1_r, &ray_floor1_g, &ray_floor1_b, 40, 120);
-  ray_floor2_r = static_cast<uint8_t>(ray_floor1_r / 3);
-  ray_floor2_g = static_cast<uint8_t>(ray_floor1_g / 3);
-  ray_floor2_b = static_cast<uint8_t>(ray_floor1_b / 3);
-  display_mode = DisplayMode::kRayTrace2;
-  xSemaphoreGive(display_mutex);
-  ESP_LOGI(MQTT_TAG, "ray tracer 2-sphere (random scene)");
-}
-
 // Executes one command (an MQTT topic + payload). Shared by the MQTT event
 // handler and the REST API (http_api_init) so both control paths behave
 // identically. Returns false if `topic` is not a known/live command. Topics
 // gated by HUB75_FULL_EFFECTS are only recognised when that is enabled, same
 // as their MQTT subscriptions.
 bool dispatch_command(const char *topic, int topic_len, const char *data, int data_len) {
+  char number_digits[kNumberLMaxDigits + 1];
   if (topic_matches(topic, topic_len, CONFIG_MQTT_MESSAGE_TOPIC)) {
     handle_message_payload(data, data_len);
 #if HUB75_FULL_EFFECTS
@@ -1273,18 +1321,6 @@ bool dispatch_command(const char *topic, int topic_len, const char *data, int da
     set_solid_color(255, 255, 255, "white");
   } else if (topic_matches(topic, topic_len, kBlackTopic)) {
     set_solid_color(0, 0, 0, "black");
-#if HUB75_FULL_EFFECTS
-  } else if (topic_matches(topic, topic_len, kStandardTest1Topic)) {
-    set_test_mode(DisplayMode::kStandardTest1, "standard test 1 (hub75/standardtest1)");
-#endif
-#if HUB75_FULL_EFFECTS
-  } else if (topic_matches(topic, topic_len, kSpaceInvadersTopic)) {
-    set_test_mode(DisplayMode::kSpaceInvaders, "space invaders (hub75/si)");
-#endif
-#if HUB75_FULL_EFFECTS
-  } else if (topic_matches(topic, topic_len, kMillipedeTopic)) {
-    set_test_mode(DisplayMode::kMillipede, "millipede (hub75/mi)");
-#endif
 #if HUB75_FULL_EFFECTS
   } else if (topic_matches(topic, topic_len, kPongTopic)) {
     set_test_mode(DisplayMode::kPong, "pong (hub75/pong)");
@@ -1320,10 +1356,6 @@ bool dispatch_command(const char *topic, int topic_len, const char *data, int da
 #if HUB75_FULL_EFFECTS
   } else if (topic_matches(topic, topic_len, kMatrixRainTopic)) {
     set_test_mode(DisplayMode::kMatrixRain, "matrix digital rain (hub75/matrix)");
-#endif
-#if HUB75_FULL_EFFECTS
-  } else if (topic_matches(topic, topic_len, kBall1Topic)) {
-    set_test_mode(DisplayMode::kBall1, "ball1 (hub75/ball1)");
 #endif
   } else if (topic_matches(topic, topic_len, kShootingStarsTopic)) {
     set_test_mode(DisplayMode::kShootingStars, "shooting stars (hub75/shootingstars)");
@@ -1361,14 +1393,6 @@ bool dispatch_command(const char *topic, int topic_len, const char *data, int da
     xSemaphoreGive(display_mutex);
     set_test_mode(DisplayMode::kPing2, "ping2 (hub75/ping2)");
 #endif
-#if HUB75_FULL_EFFECTS
-  } else if (topic_matches(topic, topic_len, kFlagUsaTopic)) {
-    set_test_mode(DisplayMode::kFlagUsa, "USA flag");
-#endif
-#if HUB75_FULL_EFFECTS
-  } else if (topic_matches(topic, topic_len, kFlagCanadaTopic)) {
-    set_test_mode(DisplayMode::kFlagCanada, "Canada flag");
-#endif
   } else if (topic_matches(topic, topic_len, kFlashTopic)) {
     toggle_blink();
   } else if (topic_matches(topic, topic_len, kNoFlashTopic)) {
@@ -1397,18 +1421,10 @@ bool dispatch_command(const char *topic, int topic_len, const char *data, int da
     set_test_mode(DisplayMode::kFixed1300E, "1300e (hub75/1300e)");
   } else if (topic_matches(topic, topic_len, kFixed1300FTopic)) {
     set_test_mode(DisplayMode::kFixed1300F, "1300f (hub75/1300f)");
-  } else if (topic_matches(topic, topic_len, kFixed1300LTopic)) {
-    set_fixed1300l(data, data_len);
+  } else if (parse_number_topic(topic, topic_len, number_digits)) {
+    set_number_l(data, data_len, number_digits);
   } else if (topic_matches(topic, topic_len, kFixed1300LITopic)) {
     set_test_mode(DisplayMode::kFixed1300LI, "1300LI (hub75/1300LI)");
-#if HUB75_FULL_EFFECTS
-  } else if (topic_matches(topic, topic_len, kRay1Topic)) {
-    set_raytrace();
-#endif
-#if HUB75_FULL_EFFECTS
-  } else if (topic_matches(topic, topic_len, kRay2Topic)) {
-    set_raytrace2();
-#endif
 #if HUB75_FULL_EFFECTS
   } else if (topic_matches(topic, topic_len, kAutoTestStartTopic)) {
     set_test_mode(DisplayMode::kAutoTest, "auto-test (hub75/0)");
@@ -1455,146 +1471,84 @@ bool dispatch_command(const char *topic, int topic_len, const char *data, int da
   return true;
 }
 
+// Wire-level replacement for the "hub75/" prefix - "hub75/<device_id_hex>/"
+// when CONFIG_MQTT_TOPIC_MAC_PREFIX is set (the default), else just
+// "hub75/" (the legacy flat scheme). Built once by mqtt_init(), before the
+// client starts, so it's ready before mqtt_event_handler's first event.
+// dispatch_command()/topic_matches()/every kXTopic constant/
+// CONFIG_MQTT_*_TOPIC stay in canonical "hub75/..." space and never need to
+// know which scheme is active - mqtt_build_wire_topic()/mqtt_normalize_topic()
+// below are the only two places that translate between the two.
+char mqtt_topic_ns[24] = "hub75/";
+char mqtt_wire_status_topic[96];
+char mqtt_wire_message_topic[96];
+
+// Rewrites a canonical "hub75/..." topic into its actual wire-level form
+// under mqtt_topic_ns; a topic not starting with "hub75/" (a fully custom
+// message topic) is passed through unchanged - the mirror image of
+// mqtt_normalize_topic() below.
+void mqtt_build_wire_topic(const char *canonical, char *out, size_t out_len) {
+  if (strncmp(canonical, "hub75/", 6) == 0) {
+    snprintf(out, out_len, "%s%s", mqtt_topic_ns, canonical + 6);
+  } else {
+    strlcpy(out, canonical, out_len);
+  }
+}
+
+// Rewrites an incoming wire-level MQTT topic back into canonical
+// "hub75/..." form by stripping the mqtt_topic_ns device-ID segment, so
+// dispatch_command() (called right after this, from MQTT_EVENT_DATA below)
+// sees exactly the same "hub75/x" strings regardless of whether MAC
+// prefixing is enabled - matching what the REST API already hands it
+// (see http_command_handler(), which never had a device-ID segment to
+// begin with). A topic that doesn't start with mqtt_topic_ns (a fully
+// custom message topic, or MAC-prefixing disabled and mqtt_topic_ns is
+// already just "hub75/") passes through unchanged.
+int mqtt_normalize_topic(const char *topic, int topic_len, char *out, size_t out_len) {
+  const size_t ns_len = strlen(mqtt_topic_ns);
+  if (static_cast<size_t>(topic_len) >= ns_len && memcmp(topic, mqtt_topic_ns, ns_len) == 0) {
+    const int rest_len = topic_len - static_cast<int>(ns_len);
+    const int written = snprintf(out, out_len, "hub75/%.*s", rest_len, topic + ns_len);
+    if (written < 0) return 0;
+    return written >= static_cast<int>(out_len) ? static_cast<int>(out_len) - 1 : written;
+  }
+  const int n = topic_len < static_cast<int>(out_len) - 1 ? topic_len : static_cast<int>(out_len) - 1;
+  memcpy(out, topic, n);
+  out[n] = '\0';
+  return n;
+}
+
 void mqtt_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
   auto *event = static_cast<esp_mqtt_event_handle_t>(event_data);
   switch (event_id) {
     case MQTT_EVENT_CONNECTED:
       ESP_LOGI(MQTT_TAG, "connected to broker");
-      esp_mqtt_client_publish(event->client, CONFIG_MQTT_STATUS_TOPIC, "online", 0, 1, true);
-      esp_mqtt_client_subscribe(event->client, CONFIG_MQTT_MESSAGE_TOPIC, 1);
-#if HUB75_FULL_EFFECTS
-      esp_mqtt_client_subscribe(event->client, kTest1Topic, 1);
-#endif
-#if HUB75_FULL_EFFECTS
-      esp_mqtt_client_subscribe(event->client, kTest2Topic, 1);
-#endif
-#if HUB75_FULL_EFFECTS
-      esp_mqtt_client_subscribe(event->client, kTest3Topic, 1);
-#endif
-      esp_mqtt_client_subscribe(event->client, kDimTopic, 1);
-      esp_mqtt_client_subscribe(event->client, kBrightTopic, 1);
-      esp_mqtt_client_subscribe(event->client, kRedTopic, 1);
-      esp_mqtt_client_subscribe(event->client, kGreenTopic, 1);
-      esp_mqtt_client_subscribe(event->client, kBlueTopic, 1);
-      esp_mqtt_client_subscribe(event->client, kYellowTopic, 1);
-      esp_mqtt_client_subscribe(event->client, kOrangeTopic, 1);
-      esp_mqtt_client_subscribe(event->client, kWhiteTopic, 1);
-      esp_mqtt_client_subscribe(event->client, kBlackTopic, 1);
-#if HUB75_FULL_EFFECTS
-      esp_mqtt_client_subscribe(event->client, kStandardTest1Topic, 1);
-#endif
-#if HUB75_FULL_EFFECTS
-      esp_mqtt_client_subscribe(event->client, kSpaceInvadersTopic, 1);
-#endif
-#if HUB75_FULL_EFFECTS
-      esp_mqtt_client_subscribe(event->client, kMillipedeTopic, 1);
-#endif
-#if HUB75_FULL_EFFECTS
-      esp_mqtt_client_subscribe(event->client, kPongTopic, 1);
-#endif
-#if HUB75_FULL_EFFECTS
-      esp_mqtt_client_subscribe(event->client, kTicTacToeTopic, 1);
-#endif
-#if HUB75_FULL_EFFECTS
-      esp_mqtt_client_subscribe(event->client, kMatrix1Topic, 1);
-#endif
-#if HUB75_FULL_EFFECTS
-      esp_mqtt_client_subscribe(event->client, kMatrix2Topic, 1);
-#endif
-#if HUB75_FULL_EFFECTS
-      esp_mqtt_client_subscribe(event->client, kMatrix3Topic, 1);
-#endif
-#if HUB75_FULL_EFFECTS
-      esp_mqtt_client_subscribe(event->client, kMatrix1ContTopic, 1);
-#endif
-#if HUB75_FULL_EFFECTS
-      esp_mqtt_client_subscribe(event->client, kMatrix2ContTopic, 1);
-#endif
-#if HUB75_FULL_EFFECTS
-      esp_mqtt_client_subscribe(event->client, kMatrix3ContTopic, 1);
-#endif
-#if HUB75_FULL_EFFECTS
-      esp_mqtt_client_subscribe(event->client, kMatrixRainTopic, 1);
-#endif
-#if HUB75_FULL_EFFECTS
-      esp_mqtt_client_subscribe(event->client, kBall1Topic, 1);
-#endif
-      esp_mqtt_client_subscribe(event->client, kShootingStarsTopic, 1);
-      esp_mqtt_client_subscribe(event->client, kTimeTopic, 1);
-      esp_mqtt_client_subscribe(event->client, kMaze1Topic, 1);
-      esp_mqtt_client_subscribe(event->client, kMaze2Topic, 1);
-      esp_mqtt_client_subscribe(event->client, kMaze3Topic, 1);
-#if HUB75_FULL_EFFECTS
-      esp_mqtt_client_subscribe(event->client, kMaze4Topic, 1);
-#endif
-#if HUB75_FULL_EFFECTS
-      esp_mqtt_client_subscribe(event->client, kMaze5Topic, 1);
-#endif
-#if HUB75_FULL_EFFECTS
-      esp_mqtt_client_subscribe(event->client, kPing1Topic, 1);
-#endif
-#if HUB75_FULL_EFFECTS
-      esp_mqtt_client_subscribe(event->client, kPing2Topic, 1);
-#endif
-#if HUB75_FULL_EFFECTS
-      esp_mqtt_client_subscribe(event->client, kFlagUsaTopic, 1);
-#endif
-#if HUB75_FULL_EFFECTS
-      esp_mqtt_client_subscribe(event->client, kFlagCanadaTopic, 1);
-#endif
-      esp_mqtt_client_subscribe(event->client, kFlashTopic, 1);
-      esp_mqtt_client_subscribe(event->client, kNoFlashTopic, 1);
-#if HUB75_FULL_EFFECTS
-      esp_mqtt_client_subscribe(event->client, kRainbowTopic, 1);
-#endif
-      esp_mqtt_client_subscribe(event->client, kOffTopic, 1);
-      esp_mqtt_client_subscribe(event->client, kFixed1300Topic, 1);
-      esp_mqtt_client_subscribe(event->client, kFixed1300AltTopic, 1);
-      esp_mqtt_client_subscribe(event->client, kFixed1300BTopic, 1);
-      esp_mqtt_client_subscribe(event->client, kFixed1300CTopic, 1);
-      esp_mqtt_client_subscribe(event->client, kFixed1300DTopic, 1);
-      esp_mqtt_client_subscribe(event->client, kFixed13Topic, 1);
-      esp_mqtt_client_subscribe(event->client, kFixed00Topic, 1);
-      esp_mqtt_client_subscribe(event->client, kFixed1300ETopic, 1);
-      esp_mqtt_client_subscribe(event->client, kFixed1300FTopic, 1);
-      esp_mqtt_client_subscribe(event->client, kFixed1300LTopic, 1);
-      esp_mqtt_client_subscribe(event->client, kFixed1300LITopic, 1);
-#if HUB75_FULL_EFFECTS
-      esp_mqtt_client_subscribe(event->client, kRay1Topic, 1);
-#endif
-#if HUB75_FULL_EFFECTS
-      esp_mqtt_client_subscribe(event->client, kRay2Topic, 1);
-#endif
-#if HUB75_FULL_EFFECTS
-      esp_mqtt_client_subscribe(event->client, kAutoTestStartTopic, 1);
-#endif
-#if HUB75_FULL_EFFECTS
-      esp_mqtt_client_subscribe(event->client, kAutoTestStopTopic, 1);
-#endif
-#if HUB75_FULL_EFFECTS
-      esp_mqtt_client_subscribe(event->client, kElevatorTopic, 1);
-#endif
-#if HUB75_FULL_EFFECTS
-      esp_mqtt_client_subscribe(event->client, kElevatorLargeTopic, 1);
-#endif
-#if HUB75_FULL_EFFECTS
-      esp_mqtt_client_subscribe(event->client, kElevatorXLargeTopic, 1);
-#endif
-      esp_mqtt_client_subscribe(event->client, kClockTopic, 1);
-      esp_mqtt_client_subscribe(event->client, kNtpSetTopic, 1);
-      esp_mqtt_client_subscribe(event->client, kClockPacificTopic, 1);
-      esp_mqtt_client_subscribe(event->client, kClockIndiaTopic, 1);
-      esp_mqtt_client_subscribe(event->client, kClockUtcTopic, 1);
-      esp_mqtt_client_subscribe(event->client, kClockMountainTopic, 1);
-      esp_mqtt_client_subscribe(event->client, kClockCentralTopic, 1);
-      esp_mqtt_client_subscribe(event->client, kClockEasternTopic, 1);
+      esp_mqtt_client_publish(event->client, mqtt_wire_status_topic, "online", 0, 1, true);
+      // One single-level wildcard covers every hub75/<name> command, including
+      // the open-ended hub75/nn..nnnnnn[L] numbers. dispatch_command() ignores
+      // anything it doesn't know (e.g. our own retained hub75/status), and
+      // topics gated by HUB75_FULL_EFFECTS are simply not recognised there.
+      // A single subscription also avoids overlapping ones, which a broker may
+      // deliver more than once (bad for toggles like hub75/flash).
+      {
+        char wildcard[32];
+        snprintf(wildcard, sizeof(wildcard), "%s+", mqtt_topic_ns);
+        esp_mqtt_client_subscribe(event->client, wildcard, 1);
+      }
+      if (strncmp(CONFIG_MQTT_MESSAGE_TOPIC, "hub75/", 6) != 0 || strchr(CONFIG_MQTT_MESSAGE_TOPIC + 6, '/') != nullptr) {
+        esp_mqtt_client_subscribe(event->client, mqtt_wire_message_topic, 1);  // custom/nested topic outside hub75/<ns>/+
+      }
       break;
     case MQTT_EVENT_DISCONNECTED:
       ESP_LOGW(MQTT_TAG, "disconnected from broker");
       break;
-    case MQTT_EVENT_DATA:
-      dispatch_command(event->topic, event->topic_len, event->data, event->data_len);
+    case MQTT_EVENT_DATA: {
+      char canonical_topic[96];
+      const int canonical_len =
+          mqtt_normalize_topic(event->topic, event->topic_len, canonical_topic, sizeof(canonical_topic));
+      dispatch_command(canonical_topic, canonical_len, event->data, event->data_len);
       break;
+    }
     case MQTT_EVENT_ERROR:
       ESP_LOGE(MQTT_TAG, "MQTT error, type=%d", event->error_handle->error_type);
       break;
@@ -1609,6 +1563,18 @@ void mqtt_init(void) {
     return;
   }
 
+  // mqtt_topic_ns/mqtt_wire_*_topic must be ready before esp_mqtt_client_start()
+  // below, since mqtt_event_handler's very first MQTT_EVENT_CONNECTED uses them.
+#if CONFIG_MQTT_TOPIC_MAC_PREFIX
+  snprintf(mqtt_topic_ns, sizeof(mqtt_topic_ns), "hub75/%s/", device_id_hex);
+#else
+  strlcpy(mqtt_topic_ns, "hub75/", sizeof(mqtt_topic_ns));
+#endif
+  mqtt_build_wire_topic(CONFIG_MQTT_STATUS_TOPIC, mqtt_wire_status_topic, sizeof(mqtt_wire_status_topic));
+  mqtt_build_wire_topic(CONFIG_MQTT_MESSAGE_TOPIC, mqtt_wire_message_topic, sizeof(mqtt_wire_message_topic));
+  ESP_LOGI(MQTT_TAG, "topic namespace '%s' (status: %s, message: %s)", mqtt_topic_ns, mqtt_wire_status_topic,
+           mqtt_wire_message_topic);
+
   esp_mqtt_client_config_t mqtt_cfg = {};
   mqtt_cfg.broker.address.uri = CONFIG_MQTT_BROKER_URI;
   mqtt_cfg.credentials.client_id = CONFIG_MQTT_CLIENT_ID;
@@ -1618,7 +1584,7 @@ void mqtt_init(void) {
   if (strlen(CONFIG_MQTT_PASSWORD) > 0) {
     mqtt_cfg.credentials.authentication.password = CONFIG_MQTT_PASSWORD;
   }
-  mqtt_cfg.session.last_will.topic = CONFIG_MQTT_STATUS_TOPIC;
+  mqtt_cfg.session.last_will.topic = mqtt_wire_status_topic;
   mqtt_cfg.session.last_will.msg = "offline";
   mqtt_cfg.session.last_will.qos = 1;
   mqtt_cfg.session.last_will.retain = true;
@@ -1633,12 +1599,23 @@ void mqtt_init(void) {
 // Same commands as MQTT, over HTTP. Every hub75/<name> topic is reachable as
 //   POST /api/command/<name>     body = the MQTT payload (may be empty)
 // e.g. POST /api/command/red, POST /api/command/message with
-// {"text":"hi","color":"#00ff00"}, POST /api/command/1300L with {"fg":...}.
+// {"text":"hi","color":"#00ff00"}, POST /api/command/1300L with {"fg":...}  (any 2-6 digit number, L optional).
 //   GET  /api/status             current display mode, heap, NTP state
 // Both go through dispatch_command(), so behaviour (incl. the lean-build
 // topic gating) is identical to MQTT. If CONFIG_HTTP_API_TOKEN is non-empty,
 // requests need "Authorization: Bearer <token>".
 static const char *HTTP_TAG = "hub75_http";
+
+// Actual URL paths in use - "/api/command/"/"/api/status" (legacy flat) or
+// "/api/<device_id_hex>/command/"/"/api/<device_id_hex>/status" when
+// CONFIG_HTTP_API_MAC_PREFIX is set (the default) - same device ID and hex
+// format as CONFIG_MQTT_TOPIC_MAC_PREFIX (see device_id_hex/mqtt_topic_ns
+// above), but an entirely independent Kconfig toggle. Built once by
+// http_api_init() before routes are registered; http_command_prefix
+// includes the trailing slash so http_command_handler can just skip past
+// it to find <name>.
+char http_command_prefix[48] = "/api/command/";
+char http_status_path[32] = "/api/status";
 
 bool http_authorized(httpd_req_t *req) {
   if (strlen(CONFIG_HTTP_API_TOKEN) == 0) return true;
@@ -1665,8 +1642,7 @@ esp_err_t http_command_handler(httpd_req_t *req) {
     return http_send_json(req, "401 Unauthorized", "{\"ok\":false,\"error\":\"unauthorized\"}");
   }
 
-  static const char kPrefix[] = "/api/command/";
-  const char *name = req->uri + (sizeof(kPrefix) - 1);
+  const char *name = req->uri + strlen(http_command_prefix);
   size_t name_len = strcspn(name, "?#");
   char topic[96];
   if (name_len == 0 || name_len > 60) {
@@ -1718,6 +1694,16 @@ esp_err_t http_status_handler(httpd_req_t *req) {
 
 void http_api_init(void) {
 #if CONFIG_HTTP_API_ENABLE
+  // http_command_prefix/http_status_path must be ready before routes are
+  // registered below, and before any request can arrive.
+#if CONFIG_HTTP_API_MAC_PREFIX
+  snprintf(http_command_prefix, sizeof(http_command_prefix), "/api/%s/command/", device_id_hex);
+  snprintf(http_status_path, sizeof(http_status_path), "/api/%s/status", device_id_hex);
+#else
+  strlcpy(http_command_prefix, "/api/command/", sizeof(http_command_prefix));
+  strlcpy(http_status_path, "/api/status", sizeof(http_status_path));
+#endif
+
   httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
   cfg.server_port = CONFIG_HTTP_API_PORT;
   cfg.uri_match_fn = httpd_uri_match_wildcard;
@@ -1730,14 +1716,18 @@ void http_api_init(void) {
     ESP_LOGE(HTTP_TAG, "httpd_start failed");
     return;
   }
-  const httpd_uri_t command_post = {"/api/command/*", HTTP_POST, http_command_handler, nullptr};
-  const httpd_uri_t command_put = {"/api/command/*", HTTP_PUT, http_command_handler, nullptr};
-  const httpd_uri_t status_get = {"/api/status", HTTP_GET, http_status_handler, nullptr};
+  char command_pattern[64];
+  snprintf(command_pattern, sizeof(command_pattern), "%s*", http_command_prefix);
+  // httpd_register_uri_handler() strdup()s .uri immediately, so it's safe
+  // for command_pattern to go out of scope right after these calls.
+  const httpd_uri_t command_post = {command_pattern, HTTP_POST, http_command_handler, nullptr};
+  const httpd_uri_t command_put = {command_pattern, HTTP_PUT, http_command_handler, nullptr};
+  const httpd_uri_t status_get = {http_status_path, HTTP_GET, http_status_handler, nullptr};
   httpd_register_uri_handler(server, &command_post);
   httpd_register_uri_handler(server, &command_put);
   httpd_register_uri_handler(server, &status_get);
-  ESP_LOGI(HTTP_TAG, "REST API listening on port %d%s", CONFIG_HTTP_API_PORT,
-           strlen(CONFIG_HTTP_API_TOKEN) ? " (token required)" : " (NO AUTH)");
+  ESP_LOGI(HTTP_TAG, "REST API listening on port %d, commands at %s*, status at %s%s", CONFIG_HTTP_API_PORT,
+           http_command_prefix, http_status_path, strlen(CONFIG_HTTP_API_TOKEN) ? " (token required)" : " (NO AUTH)");
 #endif
 }
 
@@ -1813,20 +1803,12 @@ void network_init_task(void *arg) {
 //
 // Colour channels are re-pinned vs. that source to match the physical panel,
 // so software colour == physical colour (compensating in the GPIO numbers, not
-// the drawing code). Confirmed empirically with the current 128x64 panel using
-// direct hub75/1300L colours: with the source order (R=2/4, G=3/5, B=6/8) red
-// data lit BLUE LEDs, green data lit RED and blue data lit GREEN - i.e. R->B,
-// G->R, B->G. So R now uses the pins that light red (3/5), G those that light
-// green (6/8), B those that light blue (2/4).
-// (The original 64x32 panel needed just G/B swapped - R=2/4, G=6/8, B=3/5's
-// old values - so this is a per-panel LED-order quirk; re-check if the panel
-// is ever swapped again.)
-#define WF1_R1_PIN 3
-#define WF1_R2_PIN 5
-#define WF1_G1_PIN 6
-#define WF1_G2_PIN 8
-#define WF1_B1_PIN 2
-#define WF1_B2_PIN 4
+// the drawing code) - this is a per-panel LED-order quirk, not a board
+// defect, so it's captured per-profile below rather than as one fixed set of
+// pins. A/B/C/D/E (row-select) and LAT/OE/CLK are NOT re-pinned between
+// profiles - both panels used the same values for these in every commit this
+// project has ever built from - so they stay fixed #defines, shared by every
+// PanelProfile.
 #define WF1_A_PIN  39
 #define WF1_B_PIN  38
 #define WF1_C_PIN  37
@@ -1838,11 +1820,139 @@ void network_init_task(void *arg) {
 // Onboard push button, per community documentation for this exact board
 // (mrcodetastic/HD-WF1-WF2-LED-MatrixPanel-DMA) - not yet confirmed against
 // this physical unit. Active-low (external/internal pull-up, reads LOW when
-// pressed) - see the button debounce/edge-detect logic in the render loop.
+// pressed) - see the button debounce/edge-detect/hold-duration logic in the
+// render loop: a short press reboots the board, a long press pings the
+// default gateway and blinks the lower-right pixel (see gateway_ping_task()).
 #define WF1_BUTTON_PIN 11
 
+// One of two physical panels this firmware can drive - chosen by a
+// menuconfig choice (CONFIG_PANEL_RESOLUTION_128X64/64X32, see app_main()'s
+// boot-time read), not a runtime switch. r1/g1/b1/r2/g2/b2 are the
+// WF1_*_PIN-style GPIO numbers for that channel on this profile;
+// A/B/C/D/E/LAT/OE/CLK above are shared and not part of the profile.
+// clkphase is per-profile because it's a signal-integrity workaround (see
+// mxconfig.clkphase below), not a color or geometry setting - it isn't
+// guaranteed to transfer between panels.
+struct PanelProfile {
+  const char *name;   // "128x64"/"64x32" - for logging
+  int width, height;
+  int r1, g1, b1, r2, g2, b2;
+  bool clkphase;
+};
+
+// Confirmed empirically on the current, physically-attached 128x64 panel via
+// direct hub75/1300L colours: with the naive source order (R=2/4, G=3/5,
+// B=6/8) red data lit BLUE LEDs, green data lit RED and blue data lit GREEN -
+// i.e. R->B, G->R, B->G. So R uses the pins that light red (3/5), G those
+// that light green (6/8), B those that light blue (2/4).
+constexpr PanelProfile kProfile128x64 = {
+    "128x64", kPanelMaxWidth, kPanelMaxHeight,
+    /*r1*/3, /*g1*/6, /*b1*/2, /*r2*/5, /*g2*/8, /*b2*/4,
+    /*clkphase*/false,
+};
+// Recovered directly from git history (commit a75f500, this project's first
+// commit - already a working 64x32 build), not guessed: R=2/4, G=3/5, B=6/8.
+// (A since-removed comment on this file instead claimed "R=2/4, G=6/8,
+// B=3/5" for the 64x32 panel - that does not match the actual first-commit
+// source and should be treated as superseded by this git-verified value.)
+// clkphase is UNVERIFIED for this profile and left at the 128x64 profile's
+// value as a starting guess only: `false` fixed a specific adjacent-pixel
+// ghosting bug on the 128x64 panel (see Root cause history in README.md),
+// but that fix post-dates the original 64x32 commit above, which never set
+// it. Test both values on real hardware (re-run hub75/standardtest1 /
+// hub75/red /green/blue per README's Pinout section) before trusting this
+// default - don't assume it's correct just because it compiles.
+constexpr PanelProfile kProfile64x32 = {
+    "64x32", 64, 32,
+    /*r1*/2, /*g1*/3, /*b1*/6, /*r2*/4, /*g2*/5, /*b2*/8,
+    /*clkphase*/false,
+};
+
+// The active profile's color-channel pins, set once by init_display() at
+// boot. Everything else profile-dependent (geometry) is tracked directly by
+// the PANEL_WIDTH/PANEL_HEIGHT globals above.
+int8_t active_r1_pin = static_cast<int8_t>(kProfile128x64.r1), active_g1_pin = static_cast<int8_t>(kProfile128x64.g1),
+      active_b1_pin = static_cast<int8_t>(kProfile128x64.b1);
+int8_t active_r2_pin = static_cast<int8_t>(kProfile128x64.r2), active_g2_pin = static_cast<int8_t>(kProfile128x64.g2),
+      active_b2_pin = static_cast<int8_t>(kProfile128x64.b2);
+bool active_clkphase = kProfile128x64.clkphase;
 
 static MatrixPanel_I2S_DMA *dma_display = nullptr;
+
+// Builds and starts dma_display for the given profile (geometry, pins,
+// clkphase) - everything else (driver chip, latch_blanking, double_buff,
+// refresh rate, colour depth) is fixed and doesn't vary by profile, see
+// README's "128x64 bring-up notes" for why those specific values were
+// chosen. Called once from app_main() at boot, for whichever profile
+// menuconfig selected - there is no runtime re-init.
+bool init_display(const PanelProfile &profile) {
+    PANEL_WIDTH = profile.width;
+    PANEL_HEIGHT = profile.height;
+    active_r1_pin = profile.r1;
+    active_g1_pin = profile.g1;
+    active_b1_pin = profile.b1;
+    active_r2_pin = profile.r2;
+    active_g2_pin = profile.g2;
+    active_b2_pin = profile.b2;
+    active_clkphase = profile.clkphase;
+
+    HUB75_I2S_CFG::i2s_pins pins = {
+        active_r1_pin, active_g1_pin, active_b1_pin, active_r2_pin, active_g2_pin, active_b2_pin,
+        WF1_A_PIN, WF1_B_PIN, WF1_C_PIN, WF1_D_PIN, WF1_E_PIN,
+        WF1_LAT_PIN, WF1_OE_PIN, WF1_CLK_PIN
+    };
+
+    HUB75_I2S_CFG mxconfig(PANEL_WIDTH, PANEL_HEIGHT, PANEL_CHAIN, pins);
+    mxconfig.driver = HUB75_I2S_CFG::FM6126A;
+    // latch_blanking was bumped from the library default (4) to 8 as an
+    // untested attempt at fixing a color/brightness-imbalance report (white
+    // showing as pure red; hub75/dim and hub75/bright barely affecting red
+    // or blue while working correctly on green) - it never got confirmed to
+    // help, and BCM (the per-bit-plane PWM that produces intermediate
+    // brightness levels) is exactly the kind of timing that extra latch
+    // blanking could disturb unevenly across the R/G/B driver chips. Back to
+    // the library default while that report gets re-tested. Same for both
+    // profiles - this wasn't found to vary by panel.
+    mxconfig.latch_blanking = 4;
+    // Per-profile: confirmed fix (photo evidence) on the 128x64 panel for a
+    // clock-edge signal integrity issue (two identical adjacent pixels on
+    // hub75/test1). FM6126A doesn't force this to any value (unlike
+    // MBI5124/DP3246), so flipping it was safe to try - but it's genuinely
+    // unverified whether the 64x32 profile needs it too (see kProfile64x32's
+    // comment above).
+    mxconfig.clkphase = active_clkphase;
+    // Double-buffered: without this, drawPixelRGB888/fillRect/etc. write
+    // directly into the buffer the DMA engine is actively scanning out, so
+    // any frame that takes a while to draw (hub75/ray1's per-pixel float
+    // math, mainly) is visible mid-draw as tearing/flicker. Off for both
+    // profiles: a second framebuffer at 8-bit depth doesn't fit the 128x64
+    // profile's heap budget (begin() fails with "Not enough memory"), and
+    // this firmware doesn't split double_buff by profile (kept simple - see
+    // CLAUDE.md). Costs some tearing on slow-to-draw frames (hub75/ray1);
+    // flipDMABuffer() is a harmless no-op either way.
+    mxconfig.double_buff = false;
+    // 90Hz minimum refresh (library default 60): at 60-62Hz the panel visibly
+    // flickers. The library's calc gives ~93Hz at lsbMsbTransitionBit 1, i.e.
+    // it merges only the lowest bit-plane (100 forced transition bit 2 / 150Hz
+    // and cost another bit of depth). See the lsbMsbTransitionBit lines in
+    // the applog.
+    mxconfig.min_refresh_rate = 90;
+    // 6-bit colour depth (library default 8). Heap is very tight at 128x64:
+    // 8-bit's 64KB buffer left ~9KB after WiFi init and WiFi association then
+    // failed (reason 2/202/205, see applog). 6 bits frees 16KB and, per the
+    // library's refresh-rate calc, actually runs all 6 planes at ~62Hz, where
+    // 8 bits had to merge low planes (lsbMsbTransitionBit 3) to hit 60Hz.
+    mxconfig.setPixelColorDepthBits(6);
+
+    ESP_LOGI(TAG,
+             "constructing MatrixPanel_I2S_DMA: profile=%s %dx%d chain=%d driver=FM6126A latch_blanking=%d clkphase=%d",
+             profile.name, PANEL_WIDTH, PANEL_HEIGHT, PANEL_CHAIN, mxconfig.latch_blanking, mxconfig.clkphase);
+
+    dma_display = new MatrixPanel_I2S_DMA(mxconfig);
+    bool ok = dma_display->begin();
+    ESP_LOGI(TAG, "dma_display->begin() returned %d", ok);
+    return ok;
+}
 
 // Built-in 8x8 font (NO_GFX build has no Adafruit-GFX print()/text API -
 // drawPixelRGB888 is used directly). Full printable ASCII, so arbitrary text
@@ -1925,12 +2035,12 @@ void draw_text_scaled(int16_t x, int16_t y, const char *text, int scale, uint8_t
 // Both share this geometry: scale 2 is the largest integer scale of
 // draw_text_scaled()'s font that still fits all 4 characters on the 64px
 // panel (scale 3 would need 96px), so it's centered with zero slack
-// horizontally and centered vertically in the 32px-tall panel.
+// horizontally and centered vertically in the 32px-tall panel. (kFixed1300X/Y
+// depend on the live PANEL_WIDTH/PANEL_HEIGHT, so they're computed once per
+// render-loop tick, not here - see the render loop right before its switch.)
 constexpr int kFixed1300Scale = 2;
 constexpr int16_t kFixed1300CharW = 8 * kFixed1300Scale;
 constexpr int16_t kFixed1300TextW = 4 * kFixed1300CharW;
-constexpr int16_t kFixed1300X = (PANEL_WIDTH - kFixed1300TextW) / 2;
-constexpr int16_t kFixed1300Y = (PANEL_HEIGHT - kFixed1300CharW) / 2;
 constexpr uint8_t kFixed1300Grey = 128;               // hub75/1300's grey text
 constexpr uint8_t kFixed1300BgGray = 64;              // hub75/1300a's background - 25% of 255
 constexpr uint8_t kFixed1300BgGray50 = 128;           // hub75/1300b's background - 50% of 255
@@ -1943,20 +2053,12 @@ constexpr uint8_t kFixed1300BgGray50 = 128;           // hub75/1300b's backgroun
 constexpr int16_t kFixed1300ShiftPx = 1;
 constexpr int16_t kFixed1300OneExtraShiftPx = 2;
 
-// hub75/1300L: "1300" in the Chilanka font, white on black, stretched to fill
-// the whole panel. The glyphs are pre-rendered offline (tools/gen_chilanka_1300.py)
-// into an anti-aliased 8-bit bitmap (chilanka_1300.h) that is already gamma-
-// corrected for the library's CIE lightness curve - no font renderer or heap
-// needed on the device.
-constexpr int16_t kFixed1300LX = (PANEL_WIDTH - kChilanka1300W) / 2;
-constexpr int16_t kFixed1300LY = (PANEL_HEIGHT - kChilanka1300H) / 2;
-
-// hub75/1300LI: the same bitmap inverted - black digits on a "Tan" (CSS
-// #D2B48C, RGB 210/180/140) background. chilanka_1300.h stores values already
-// passed through the inverse of the library's CIE 1931 lightness curve, so
-// edge pixels can't just be flipped/blended in value space: recover the linear
-// coverage (forward CIE), scale the background's linear luminance by
-// (1 - coverage), and re-apply the inverse curve, per colour channel.
+// hub75/nn..nnnnnn (optional L): a 2-6 digit number in the Chilanka font, stretched to
+// fill the whole panel. The ten digit glyphs are pre-rendered offline
+// (tools/gen_chilanka_digits.py -> chilanka_digits.h, flash only) and composed
+// at draw time by draw_chilanka_number() - no font renderer or heap needed.
+// hub75/1300LI: "1300" inverted - black digits on a "Tan" (CSS #D2B48C, RGB
+// 210/180/140) background, drawn by draw_chilanka_number() with fg/bg swapped.
 constexpr uint8_t kFixed1300LIBgR = 210;
 constexpr uint8_t kFixed1300LIBgG = 180;
 constexpr uint8_t kFixed1300LIBgB = 140;
@@ -1974,12 +2076,16 @@ uint8_t cie_linear_to_value(float y) {  // inverse of the above
   return static_cast<uint8_t>(out < 0.0f ? 0.0f : (out > 255.0f ? 255.0f : out));
 }
 
-// Draws the Chilanka "1300" bitmap in fg over bg, both first multiplied by hue
-// (per channel, /255). Edge pixels blend fg over bg by the glyph coverage in
-// linear-light space (via the library's CIE curve, see above), so
-// anti-aliasing stays right for any colour pair. White on black with a white
-// hue reproduces the raw bitmap values.
-void draw_chilanka_1300(const uint8_t fg[3], const uint8_t bg[3], const uint8_t hue[3]) {
+// Draws `digits` (2-6 characters '0'-'9') in the Chilanka font, stretched
+// non-uniformly so the ink box of the whole string touches all four panel
+// edges. The glyphs (chilanka_digits.h) are laid out with the font's own
+// advances/bearings, then every panel pixel box-filters the source pixels it
+// covers, in linear coverage. Colours: fg over bg, both first multiplied by
+// hue (per channel, /255); edge pixels blend in linear light through the
+// display library's CIE curve (see above), so anti-aliasing stays right for
+// any colour pair. Runs once per change (static screen), so the plain
+// per-sample glyph search is fast enough.
+void draw_chilanka_number(const char *digits, const uint8_t fg[3], const uint8_t bg[3], const uint8_t hue[3]) {
   uint8_t f[3], b[3];
   float f_lin[3], b_lin[3];
   for (int i = 0; i < 3; i++) {
@@ -1989,19 +2095,54 @@ void draw_chilanka_1300(const uint8_t fg[3], const uint8_t bg[3], const uint8_t 
     b_lin[i] = cie_value_to_linear(b[i]);
   }
   dma_display->fillScreenRGB888(b[0], b[1], b[2]);
-  for (int y = 0; y < kChilanka1300H; y++) {
-    for (int x = 0; x < kChilanka1300W; x++) {
-      const uint8_t v = kChilanka1300[y * kChilanka1300W + x];
-      if (!v) continue;  // background
+
+  const ChilankaDigit *g[kNumberLMaxDigits];
+  int ink_left[kNumberLMaxDigits];  // absolute x of each glyph's ink start
+  int n = 0, pen = 0, top = kChilankaDigitRows, bot = 0;
+  for (; n < kNumberLMaxDigits && digits[n] >= '0' && digits[n] <= '9'; n++) {
+    g[n] = &kChilankaDigits[digits[n] - '0'];
+    ink_left[n] = pen + g[n]->lsb;
+    pen += g[n]->adv;
+    if (g[n]->top < top) top = g[n]->top;
+    if (g[n]->bot > bot) bot = g[n]->bot;
+  }
+  if (n == 0 || bot <= top) return;
+  const int left = ink_left[0];
+  const int span_w = ink_left[n - 1] + g[n - 1]->w - left;
+  const int span_h = bot - top;
+  if (span_w <= 0) return;
+
+  const float sx = static_cast<float>(span_w) / PANEL_WIDTH, sy = static_cast<float>(span_h) / PANEL_HEIGHT;
+  for (int py = 0; py < PANEL_HEIGHT; py++) {
+    const float y0 = py * sy, y1 = y0 + sy;
+    for (int px = 0; px < PANEL_WIDTH; px++) {
+      const float x0 = px * sx, x1 = x0 + sx;
+      float sum = 0.0f;
+      for (int yy = static_cast<int>(y0); yy < y1 && yy < span_h; yy++) {
+        const float wy = fminf(yy + 1.0f, y1) - fmaxf(static_cast<float>(yy), y0);
+        const int row = top + yy;
+        for (int xx = static_cast<int>(x0); xx < x1 && xx < span_w; xx++) {
+          const float wx = fminf(xx + 1.0f, x1) - fmaxf(static_cast<float>(xx), x0);
+          const int ax = left + xx;
+          uint8_t v = 0;
+          for (int i = 0; i < n; i++) {
+            const int gx = ax - ink_left[i];
+            if (gx < 0 || gx >= g[i]->w || row < g[i]->top || row >= g[i]->bot) continue;
+            const uint8_t s = kChilankaDigitData[g[i]->off + (row - g[i]->top) * g[i]->w + gx];
+            if (s > v) v = s;
+          }
+          sum += wx * wy * v;
+        }
+      }
+      float cov = sum / (sx * sy * 255.0f);
+      if (cov <= 0.002f) continue;  // background
       uint8_t o[3];
-      if (v == 255) {
+      if (cov >= 0.996f) {
         memcpy(o, f, 3);
       } else {
-        const float cov = cie_value_to_linear(v);
         for (int i = 0; i < 3; i++) o[i] = cie_linear_to_value(b_lin[i] + (f_lin[i] - b_lin[i]) * cov);
       }
-      dma_display->drawPixelRGB888(static_cast<int16_t>(kFixed1300LX + x), static_cast<int16_t>(kFixed1300LY + y), o[0],
-                                   o[1], o[2]);
+      dma_display->drawPixelRGB888(static_cast<int16_t>(px), static_cast<int16_t>(py), o[0], o[1], o[2]);
     }
   }
 }
@@ -2326,66 +2467,6 @@ void draw_digit_scroll(int16_t x, int16_t y, char old_c, char new_c, int t, bool
   }
 }
 
-// hub75/flag: simplified/stylized US flag. 64x32 can't fit 50 individually
-// legible stars, but it can fit the real 13 stripes (via cumulative integer
-// division so the odd remainder pixels spread evenly instead of piling into
-// one fat stripe) and a denser star field than a plain grid: 23 dots in the
-// canton, laid out as 3 long rows of 5 interleaved with 2 short rows of 4 -
-// the same long/short row offset the real 50-star pattern uses, just with
-// fewer stars per row.
-void draw_flag_usa() {
-  constexpr int16_t kStripeCount = 13;
-  int16_t y_prev = 0;
-  for (int16_t i = 1; i <= kStripeCount; i++) {
-    const int16_t y = static_cast<int16_t>((static_cast<int32_t>(i) * PANEL_HEIGHT) / kStripeCount);
-    const int16_t h = y - y_prev;
-    const bool red = (i % 2) == 1;  // stripe 1 (top) and 13 (bottom) are both red
-    dma_display->fillRect(0, y_prev, PANEL_WIDTH, h, red ? 255 : 255, red ? 0 : 255, red ? 0 : 255);
-    y_prev = y;
-  }
-
-  constexpr int16_t kCantonW = 26;
-  constexpr int16_t kCantonH = (7 * PANEL_HEIGHT) / 13;  // covers stripes 1-7, same formula as above
-  dma_display->fillRect(0, 0, kCantonW, kCantonH, 0, 0, 128);
-
-  constexpr int16_t kStarRowY[5] = {2, 5, 8, 11, 14};
-  constexpr int16_t kLongRowX[5] = {3, 8, 13, 18, 23};
-  constexpr int16_t kShortRowX[4] = {5, 10, 15, 20};
-  for (int16_t row = 0; row < 5; row++) {
-    const bool long_row = (row % 2) == 0;
-    const int16_t *xs = long_row ? kLongRowX : kShortRowX;
-    const int16_t count = long_row ? 5 : 4;
-    for (int16_t col = 0; col < count; col++) {
-      dma_display->drawPixelRGB888(xs[col], kStarRowY[row], 255, 255, 255);
-    }
-  }
-}
-
-// hub75/canada: simplified/stylized Canadian flag - red/white/red vertical
-// bands with a hand-drawn, stylized (not anatomically exact) maple leaf
-// silhouette in the center band.
-constexpr uint16_t kMapleLeaf[11] = {
-    0b00001000000, 0b00001000000, 0b00011100000, 0b01011101000, 0b11111111110,
-    0b00111110000, 0b01111111100, 0b10111110110, 0b00011100000, 0b00001000000,
-    0b00001000000,
-};
-
-void draw_flag_canada() {
-  constexpr int16_t kBandW = PANEL_WIDTH / 4;  // 16px red bands each side
-  dma_display->fillRect(0, 0, kBandW, PANEL_HEIGHT, 255, 0, 0);
-  dma_display->fillRect(kBandW, 0, PANEL_WIDTH - 2 * kBandW, PANEL_HEIGHT, 255, 255, 255);
-  dma_display->fillRect(PANEL_WIDTH - kBandW, 0, kBandW, PANEL_HEIGHT, 255, 0, 0);
-
-  constexpr int16_t kLeafX = (PANEL_WIDTH - 11) / 2;
-  constexpr int16_t kLeafY = (PANEL_HEIGHT - 11) / 2;
-  for (int16_t row = 0; row < 11; row++) {
-    for (int16_t col = 0; col < 11; col++) {
-      if ((kMapleLeaf[row] & (1 << (10 - col))) == 0) continue;
-      dma_display->drawPixelRGB888(kLeafX + col, kLeafY + row, 255, 0, 0);
-    }
-  }
-}
-
 // hub75/rainbow: one solid-color horizontal line per row.
 void draw_rainbow(const uint8_t *r, const uint8_t *g, const uint8_t *b) {
   for (int16_t row = 0; row < PANEL_HEIGHT; row++) {
@@ -2429,15 +2510,15 @@ void draw_time_clock() {
   draw_time_frame();
 
   constexpr int16_t kBoxX = 2;
-  constexpr int16_t kBoxW = PANEL_WIDTH - 4;                          // 60
-  constexpr int16_t kCenterLineY = (PANEL_HEIGHT - 2) / 2;            // 15
+  const int16_t kBoxW = static_cast<int16_t>(PANEL_WIDTH - 4);                          // 60
+  const int16_t kCenterLineY = static_cast<int16_t>((PANEL_HEIGHT - 2) / 2);            // 15
   constexpr int16_t kTopBoxY = 2;
-  constexpr int16_t kTopBoxH = kCenterLineY - kTopBoxY;               // 13
-  constexpr int16_t kBottomBoxY = kCenterLineY + 2;                   // 17
-  constexpr int16_t kBottomBoxH = (PANEL_HEIGHT - 2) - kBottomBoxY;   // 13
-  constexpr int16_t kTextX = kBoxX + (kBoxW - kTimeTextW) / 2;
-  constexpr int16_t kTopTextY = kTopBoxY + (kTopBoxH - kTimeDigitH) / 2;
-  constexpr int16_t kBottomTextY = kBottomBoxY + (kBottomBoxH - kTimeDigitH) / 2;
+  const int16_t kTopBoxH = static_cast<int16_t>(kCenterLineY - kTopBoxY);               // 13
+  const int16_t kBottomBoxY = static_cast<int16_t>(kCenterLineY + 2);                   // 17
+  const int16_t kBottomBoxH = static_cast<int16_t>((PANEL_HEIGHT - 2) - kBottomBoxY);   // 13
+  const int16_t kTextX = static_cast<int16_t>(kBoxX + (kBoxW - kTimeTextW) / 2);
+  const int16_t kTopTextY = static_cast<int16_t>(kTopBoxY + (kTopBoxH - kTimeDigitH) / 2);
+  const int16_t kBottomTextY = static_cast<int16_t>(kBottomBoxY + (kBottomBoxH - kTimeDigitH) / 2);
 
   apply_clock_tz(ClockTz::kPacific);
   time_t now_w = time(nullptr);
@@ -2450,115 +2531,6 @@ void draw_time_clock() {
   struct tm tm_e;
   localtime_r(&now_e, &tm_e);
   draw_time_hhmmss(kTextX, kBottomTextY, tm_e.tm_hour, tm_e.tm_min, tm_e.tm_sec, 0, 255, 0);
-}
-
-// hub75/ray1 (1 sphere) and hub75/ray2 (2 spheres): minimal per-pixel ray
-// tracer - sphere(s) over a checkerboard floor, with a point light
-// continuously orbiting (driven by esp_timer_get_time(), so this needs no
-// frame-counter state threaded in from app_main - it's a pure function of
-// wall time), diffuse+specular shading on the sphere(s), and a real shadow
-// ray for the floor (occluded by any sphere). Colors are randomized per
-// message - see set_raytrace()/set_raytrace2().
-struct RtVec3 {
-  float x, y, z;
-};
-inline RtVec3 operator+(RtVec3 a, RtVec3 b) { return {a.x + b.x, a.y + b.y, a.z + b.z}; }
-inline RtVec3 operator-(RtVec3 a, RtVec3 b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
-inline RtVec3 operator*(RtVec3 a, float s) { return {a.x * s, a.y * s, a.z * s}; }
-inline float rt_dot(RtVec3 a, RtVec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
-inline RtVec3 rt_normalize(RtVec3 a) {
-  const float len = sqrtf(rt_dot(a, a));
-  return len > 1e-6f ? a * (1.0f / len) : a;
-}
-
-struct RtSphere {
-  RtVec3 center;
-  float radius;
-  uint8_t r, g, b;
-};
-
-void draw_raytracer(const RtSphere *spheres, int sphere_count, RtVec3 light_center, float floor_y, uint8_t floor1_r,
-                     uint8_t floor1_g, uint8_t floor1_b, uint8_t floor2_r, uint8_t floor2_g, uint8_t floor2_b) {
-  constexpr RtVec3 kOrigin = {0.0f, 0.0f, 0.0f};
-  constexpr float kTanHalfFov = 0.5774f;  // ~60deg field of view
-  const float kAspect = static_cast<float>(PANEL_WIDTH) / PANEL_HEIGHT;
-  constexpr float kTwoPi = 6.283185307f;
-
-  const float theta = fmodf(static_cast<float>(esp_timer_get_time()) * 1.2e-6f, kTwoPi);
-  const RtVec3 light = light_center + RtVec3{3.0f * cosf(theta), 3.0f, 3.0f * sinf(theta)};
-
-  for (int16_t py = 0; py < PANEL_HEIGHT; py++) {
-    const float ndc_y = 1.0f - ((py + 0.5f) / PANEL_HEIGHT) * 2.0f;
-    for (int16_t px = 0; px < PANEL_WIDTH; px++) {
-      const float ndc_x = (((px + 0.5f) / PANEL_WIDTH) * 2.0f - 1.0f) * kAspect;
-      const RtVec3 dir = rt_normalize(RtVec3{ndc_x * kTanHalfFov, ndc_y * kTanHalfFov, 1.0f});
-
-      int hit_idx = -1;
-      float t_sphere = 0.0f;
-      for (int s = 0; s < sphere_count; s++) {
-        const RtVec3 oc = kOrigin - spheres[s].center;
-        const float sb = 2.0f * rt_dot(oc, dir);
-        const float sc = rt_dot(oc, oc) - spheres[s].radius * spheres[s].radius;
-        const float sdisc = sb * sb - 4.0f * sc;
-        if (sdisc < 0.0f) continue;
-        const float t = (-sb - sqrtf(sdisc)) * 0.5f;
-        if (t <= 0.0f) continue;
-        if (hit_idx == -1 || t < t_sphere) {
-          hit_idx = s;
-          t_sphere = t;
-        }
-      }
-      const bool sphere_hit = hit_idx >= 0;
-
-      const bool floor_hit = dir.y < -1e-4f;
-      const float t_floor = floor_hit ? (floor_y / dir.y) : 0.0f;
-
-      uint8_t r, g, b;
-      if (sphere_hit && (!floor_hit || t_sphere < t_floor)) {
-        const RtSphere &sph = spheres[hit_idx];
-        const RtVec3 hit = dir * t_sphere;
-        const RtVec3 normal = (hit - sph.center) * (1.0f / sph.radius);
-        const RtVec3 light_dir = rt_normalize(light - hit);
-        const RtVec3 view_dir = rt_normalize(kOrigin - hit);
-        const RtVec3 half_vec = rt_normalize(light_dir + view_dir);
-        const float diffuse = fmaxf(0.0f, rt_dot(normal, light_dir));
-        const float spec = powf(fmaxf(0.0f, rt_dot(normal, half_vec)), 32.0f);
-        const float intensity = 0.15f + diffuse * 0.85f;
-        r = static_cast<uint8_t>(fminf(255.0f, sph.r * intensity + 255.0f * spec * 0.6f));
-        g = static_cast<uint8_t>(fminf(255.0f, sph.g * intensity + 255.0f * spec * 0.6f));
-        b = static_cast<uint8_t>(fminf(255.0f, sph.b * intensity + 255.0f * spec * 0.6f));
-      } else if (floor_hit) {
-        const RtVec3 hit = dir * t_floor;
-        const int checker = (static_cast<int>(floorf(hit.x)) + static_cast<int>(floorf(hit.z)) + 2000) & 1;
-        const uint8_t base_r = checker ? floor1_r : floor2_r;
-        const uint8_t base_g = checker ? floor1_g : floor2_g;
-        const uint8_t base_b = checker ? floor1_b : floor2_b;
-        const RtVec3 shadow_origin = hit + RtVec3{0.0f, 1e-3f, 0.0f};
-        const RtVec3 light_dir = rt_normalize(light - shadow_origin);
-        bool shadowed = false;
-        for (int s = 0; s < sphere_count; s++) {
-          const RtVec3 soc = shadow_origin - spheres[s].center;
-          const float shb = 2.0f * rt_dot(soc, light_dir);
-          const float shc = rt_dot(soc, soc) - spheres[s].radius * spheres[s].radius;
-          const float shdisc = shb * shb - 4.0f * shc;
-          if (shdisc >= 0.0f && (-shb - sqrtf(shdisc)) > 0.0f) {
-            shadowed = true;
-            break;
-          }
-        }
-        const float ndotl = fmaxf(0.0f, light_dir.y);
-        const float intensity = shadowed ? 0.15f : (0.15f + ndotl * 0.85f);
-        r = static_cast<uint8_t>(base_r * intensity);
-        g = static_cast<uint8_t>(base_g * intensity);
-        b = static_cast<uint8_t>(base_b * intensity);
-      } else {
-        r = 0;
-        g = 0;
-        b = static_cast<uint8_t>(30.0f * ((ndc_y + 1.0f) / 2.0f));
-      }
-      dma_display->drawPixelRGB888(px, py, r, g, b);
-    }
-  }
 }
 
 }  // namespace
@@ -2664,59 +2636,21 @@ extern "C" void app_main(void)
 
     display_mutex = xSemaphoreCreateMutex();
     parse_ping_targets();  // hub75/ping1 and hub75/ping2's target list - see CONFIG_PING_TARGETS
+    compute_device_id();  // needed by mqtt_init()/http_api_init() below for MAC-prefixed topics/paths
+    ESP_LOGI(TAG, "device ID: %s", device_id_hex);
 
-    HUB75_I2S_CFG::i2s_pins pins = {
-        WF1_R1_PIN, WF1_G1_PIN, WF1_B1_PIN, WF1_R2_PIN, WF1_G2_PIN, WF1_B2_PIN,
-        WF1_A_PIN, WF1_B_PIN, WF1_C_PIN, WF1_D_PIN, WF1_E_PIN,
-        WF1_LAT_PIN, WF1_OE_PIN, WF1_CLK_PIN
-    };
+    // Panel resolution is a menuconfig choice (CONFIG_PANEL_RESOLUTION_*,
+    // 'HD-WF1 Panel'), not a runtime switch - see the PanelProfile comment
+    // near WF1_BUTTON_PIN above.
+#if CONFIG_PANEL_RESOLUTION_64X32
+    const PanelProfile &boot_profile = kProfile64x32;
+#else
+    const PanelProfile &boot_profile = kProfile128x64;
+#endif
+    ESP_LOGI(TAG, "boot panel profile: %s (from menuconfig)", boot_profile.name);
 
-    HUB75_I2S_CFG mxconfig(PANEL_WIDTH, PANEL_HEIGHT, PANEL_CHAIN, pins);
-    mxconfig.driver = HUB75_I2S_CFG::FM6126A;
-    // latch_blanking was bumped from the library default (4) to 8 as an
-    // untested attempt at fixing a color/brightness-imbalance report (white
-    // showing as pure red; hub75/dim and hub75/bright barely affecting red
-    // or blue while working correctly on green) - it never got confirmed to
-    // help, and BCM (the per-bit-plane PWM that produces intermediate
-    // brightness levels) is exactly the kind of timing that extra latch
-    // blanking could disturb unevenly across the R/G/B driver chips. Back to
-    // the library default while that report gets re-tested.
-    mxconfig.latch_blanking = 4;
-    // Confirmed fix (photo evidence) for a *different*, already-resolved
-    // bug: two identical adjacent pixels on hub75/test1, a clock-edge signal
-    // integrity issue. FM6126A doesn't force this to any value (unlike
-    // MBI5124/DP3246), so flipping it was safe to try.
-    mxconfig.clkphase = false;  // was true (the default)
-    // Double-buffered: without this, drawPixelRGB888/fillRect/etc. write
-    // directly into the buffer the DMA engine is actively scanning out, so
-    // any frame that takes a while to draw (hub75/ray1's per-pixel float
-    // math, mainly) is visible mid-draw as tearing/flicker. With this on,
-    // drawing happens into a hidden back buffer and flipDMABuffer() (see the
-    // render loop) swaps it in atomically once the frame is complete.
-    // Off for 128x64: a second 64KB framebuffer at 8-bit depth doesn't fit in
-    // the ~139KB free heap (begin() fails with "Not enough memory"). Costs
-    // some tearing on slow-to-draw frames (hub75/ray1); flipDMABuffer() is
-    // a harmless no-op when this is off. Was true on the 64x32 panel.
-    mxconfig.double_buff = false;
-    // 90Hz minimum refresh (library default 60): at 60-62Hz the panel visibly
-    // flickers. The library's calc gives ~93Hz at lsbMsbTransitionBit 1, i.e.
-    // it merges only the lowest bit-plane (100 forced transition bit 2 / 150Hz
-    // and cost another bit of depth). See the lsbMsbTransitionBit lines in
-    // the applog.
-    mxconfig.min_refresh_rate = 90;
-    // 6-bit colour depth (library default 8). Heap is very tight at 128x64:
-    // 8-bit's 64KB buffer left ~9KB after WiFi init and WiFi association then
-    // failed (reason 2/202/205, see applog). 6 bits frees 16KB and, per the
-    // library's refresh-rate calc, actually runs all 6 planes at ~62Hz, where
-    // 8 bits had to merge low planes (lsbMsbTransitionBit 3) to hit 60Hz.
-    mxconfig.setPixelColorDepthBits(6);
-
-    ESP_LOGI(TAG, "constructing MatrixPanel_I2S_DMA: %dx%d chain=%d driver=FM6126A latch_blanking=%d clkphase=%d",
-             PANEL_WIDTH, PANEL_HEIGHT, PANEL_CHAIN, mxconfig.latch_blanking, mxconfig.clkphase);
-
-    dma_display = new MatrixPanel_I2S_DMA(mxconfig);
-    bool ok = dma_display->begin();
-    ESP_LOGI(TAG, "dma_display->begin() returned %d", ok);
+    bool ok = init_display(boot_profile);
+    ESP_LOGI(TAG, "boot init_display() returned %d", ok);
     if (!ok) {
         ESP_LOGE(TAG, "begin() FAILED");
         while (true) {
@@ -2759,6 +2693,13 @@ extern "C" void app_main(void)
     xTaskCreate(maze4_task, "maze4", 4096, nullptr, tskIDLE_PRIORITY + 1, nullptr);
 #endif
 
+    // Onboard button's long-press action (see gateway_ping_task() and the
+    // button handling in the render loop) - always live, not gated by
+    // HUB75_FULL_EFFECTS, since it's a base hardware feature rather than an
+    // MQTT-triggered effect.
+    gateway_ping_trigger = xSemaphoreCreateBinary();
+    xTaskCreate(gateway_ping_task, "gateway_ping", 4096, nullptr, tskIDLE_PRIORITY + 1, nullptr);
+
     // Until the first MQTT message arrives, this shows live WiFi status
     // instead (see set_wifi_status_connecting()/set_wifi_status_connected()
     // and display_mode). Scrolled text/color is updated live from
@@ -2787,7 +2728,7 @@ extern "C" void app_main(void)
     constexpr int16_t kBarWidth = 5;
     constexpr int16_t kBarGap = 1;
     constexpr int16_t kBarsTotalWidth = kBarCount * kBarWidth + (kBarCount - 1) * kBarGap;
-    constexpr int16_t kBarsStartX = (PANEL_WIDTH - kBarsTotalWidth) / 2;
+    const int16_t kBarsStartX = static_cast<int16_t>((PANEL_WIDTH - kBarsTotalWidth) / 2);
     constexpr int kBarRefreshTicks = 8;  // ~240ms
     constexpr uint8_t kBarPalette[kBarCount][3] = {
         {255, 0, 0}, {255, 128, 0}, {255, 255, 0}, {128, 255, 0}, {0, 255, 0},
@@ -2963,19 +2904,19 @@ extern "C" void app_main(void)
     constexpr int16_t kClockGap = 1;
     constexpr int16_t kClockBlockW =
         6 * kClockDigitW + 2 * kClockColonW + 4 * kClockGap;  // HH:MM:SS = 60px
-    constexpr int16_t kClockStartX = (PANEL_WIDTH - kClockBlockW) / 2;
-    constexpr int16_t kClockY = (PANEL_HEIGHT - 8) / 2;
-    constexpr int16_t kClockSlotX[6] = {
-        kClockStartX,
-        kClockStartX + kClockDigitW,
-        kClockStartX + 2 * kClockDigitW + kClockGap + kClockColonW + kClockGap,
-        kClockStartX + 3 * kClockDigitW + kClockGap + kClockColonW + kClockGap,
-        kClockStartX + 4 * kClockDigitW + 2 * (kClockGap + kClockColonW + kClockGap),
-        kClockStartX + 5 * kClockDigitW + 2 * (kClockGap + kClockColonW + kClockGap),
+    const int16_t kClockStartX = static_cast<int16_t>((PANEL_WIDTH - kClockBlockW) / 2);
+    const int16_t kClockY = static_cast<int16_t>((PANEL_HEIGHT - 8) / 2);
+    const int16_t kClockSlotX[6] = {
+        static_cast<int16_t>(kClockStartX),
+        static_cast<int16_t>(kClockStartX + kClockDigitW),
+        static_cast<int16_t>(kClockStartX + 2 * kClockDigitW + kClockGap + kClockColonW + kClockGap),
+        static_cast<int16_t>(kClockStartX + 3 * kClockDigitW + kClockGap + kClockColonW + kClockGap),
+        static_cast<int16_t>(kClockStartX + 4 * kClockDigitW + 2 * (kClockGap + kClockColonW + kClockGap)),
+        static_cast<int16_t>(kClockStartX + 5 * kClockDigitW + 2 * (kClockGap + kClockColonW + kClockGap)),
     };
-    constexpr int16_t kClockColonX[2] = {
-        kClockStartX + 2 * kClockDigitW + kClockGap,
-        kClockStartX + 4 * kClockDigitW + kClockGap + (kClockGap + kClockColonW + kClockGap),
+    const int16_t kClockColonX[2] = {
+        static_cast<int16_t>(kClockStartX + 2 * kClockDigitW + kClockGap),
+        static_cast<int16_t>(kClockStartX + 4 * kClockDigitW + kClockGap + (kClockGap + kClockColonW + kClockGap)),
     };
     char clock_digit_old[6];
     char clock_digit_cur[6];
@@ -2990,9 +2931,9 @@ extern "C" void app_main(void)
     // corner, blinking ~500ms on/off, shown once ntp_synced is true.
     constexpr int16_t kClockDotSize = 2;
     constexpr int16_t kClockDotGap = 1;
-    constexpr int16_t kClockDotY = PANEL_HEIGHT - kClockDotSize;
-    constexpr int16_t kClockDotX0 = PANEL_WIDTH - 2 * kClockDotSize - kClockDotGap;
-    constexpr int16_t kClockDotX1 = kClockDotX0 + kClockDotSize + kClockDotGap;
+    const int16_t kClockDotY = static_cast<int16_t>(PANEL_HEIGHT - kClockDotSize);
+    const int16_t kClockDotX0 = static_cast<int16_t>(PANEL_WIDTH - 2 * kClockDotSize - kClockDotGap);
+    const int16_t kClockDotX1 = static_cast<int16_t>(kClockDotX0 + kClockDotSize + kClockDotGap);
     constexpr int kClockDotBlinkTicks = 17;  // 17 * 30ms ~= 500ms per phase
     int clock_dot_tick = 0;
 
@@ -3043,14 +2984,14 @@ extern "C" void app_main(void)
 
     int clock_confirm_tick = 0;
 
-    // hub75/standardtest1: white/red/green/blue x dim/bright, ~2s/phase,
-    // restarts at phase 0 every activation - see the kStandardTest1 case
-    // below. Advances automatically, or manually via a short press of the
-    // onboard button while this mode is active (see the button poll below,
-    // right before the mode switch).
-    int std1_phase = 0;
-    int std1_phase_tick = 0;
     bool button_prev_raw = true;  // true = unpressed (active-low)
+    // A short press reboots the board; a long press (see
+    // kButtonLongPressTicks below) pings the default gateway instead (see
+    // gateway_ping_task()) - both regardless of the active display mode.
+    // Counted in render-loop ticks (~30ms cadence), not wall-clock time - no
+    // separate debounce is needed beyond that cadence.
+    constexpr int kButtonLongPressTicks = 33;  // ~1s
+    int button_hold_ticks = 0;
 
     // hub75/matrix1c/2c/3c: re-randomize every ~0.25s while any of the three
     // continuous variants is active - see the kMatrix*Cont render-loop
@@ -3063,15 +3004,20 @@ extern "C" void app_main(void)
     // small_font_glyph() above) with a bright head and a fading green tail.
     // Position/speed/length per column are randomized independently and
     // re-rolled once a column's whole trail has scrolled past the bottom.
-    constexpr int kMatrixRainCols = PANEL_WIDTH / kSmallFontAdvance;  // 64/4 = 16
+    // Sized off the largest supported panel (kMatrixRainColsMax), not the
+    // live PANEL_WIDTH, since this bounds fixed-capacity arrays that must
+    // fit either panel profile; only the first (PANEL_WIDTH /
+    // kSmallFontAdvance) columns are ever active/drawn at runtime, so a
+    // narrower panel just uses a prefix of this capacity.
+    constexpr int kMatrixRainColsMax = kPanelMaxWidth / kSmallFontAdvance;  // 128/4 = 32
     constexpr int kMatrixRainRowH = kSmallFontHeight + 1;             // 5px glyph + 1px gap
     constexpr int kMatrixRainMaxLen = 9;
     constexpr char kMatrixRainCharset[] = "0123456789ACNRTIMESotnecdryigmphub./=:";
     constexpr int kMatrixRainCharsetLen = sizeof(kMatrixRainCharset) - 1;  // exclude the trailing NUL
-    float matrix_rain_row[kMatrixRainCols];
-    float matrix_rain_speed[kMatrixRainCols];
-    int matrix_rain_len[kMatrixRainCols];
-    char matrix_rain_chars[kMatrixRainCols][kMatrixRainMaxLen];
+    float matrix_rain_row[kMatrixRainColsMax];
+    float matrix_rain_speed[kMatrixRainColsMax];
+    int matrix_rain_len[kMatrixRainColsMax];
+    char matrix_rain_chars[kMatrixRainColsMax][kMatrixRainMaxLen];
 
     auto reset_matrix_rain_column = [&](int c, bool randomize_start) {
         matrix_rain_speed[c] = 0.12f + static_cast<float>(esp_random() % 24) / 100.0f;
@@ -3081,15 +3027,15 @@ extern "C" void app_main(void)
         }
         // Stagger restarts: start above (or, on first entry, anywhere within)
         // the panel so every column doesn't reset in lockstep.
-        constexpr int kRows = PANEL_HEIGHT / kMatrixRainRowH;
+        const int kRows = PANEL_HEIGHT / kMatrixRainRowH;
         matrix_rain_row[c] = randomize_start
             ? -static_cast<float>(esp_random() % (kRows + kMatrixRainMaxLen))
             : -static_cast<float>(esp_random() % kMatrixRainMaxLen);
     };
-    for (int c = 0; c < kMatrixRainCols; c++) reset_matrix_rain_column(c, true);
+    for (int c = 0; c < PANEL_WIDTH / kSmallFontAdvance; c++) reset_matrix_rain_column(c, true);
 
     auto run_matrix_rain_frame = [&]() {
-        for (int c = 0; c < kMatrixRainCols; c++) {
+        for (int c = 0; c < PANEL_WIDTH / kSmallFontAdvance; c++) {
             matrix_rain_row[c] += matrix_rain_speed[c];
             const int head_row = static_cast<int>(floorf(matrix_rain_row[c]));
             const int len = matrix_rain_len[c];
@@ -3114,58 +3060,6 @@ extern "C" void app_main(void)
                 }
                 const char glyph[2] = {matrix_rain_chars[c][i], '\0'};
                 draw_text_small(x, y, glyph, r, g, b);
-            }
-        }
-    };
-
-    // hub75/ball1: a filled 8x8 ball bouncing around the panel - picks a
-    // fresh random (vibrant, not near-black) color whenever it hits any of
-    // the four walls. Position/velocity/color reset on every activation
-    // (see the kBall1 reset block below).
-    float ball1_x = (PANEL_WIDTH - 8) / 2.0f, ball1_y = (PANEL_HEIGHT - 8) / 2.0f;
-    float ball1_vx = 0.8f, ball1_vy = 0.6f;
-    uint8_t ball1_r = 255, ball1_g = 255, ball1_b = 255;
-
-    auto run_ball1_frame = [&]() {
-        constexpr int16_t kBallSize = 8;
-        constexpr float kRadius = kBallSize / 2.0f - 0.3f;
-
-        ball1_x += ball1_vx;
-        ball1_y += ball1_vy;
-        bool hit = false;
-        if (ball1_x <= 0.0f) {
-            ball1_x = 0.0f;
-            ball1_vx = -ball1_vx;
-            hit = true;
-        } else if (ball1_x >= PANEL_WIDTH - kBallSize) {
-            ball1_x = PANEL_WIDTH - kBallSize;
-            ball1_vx = -ball1_vx;
-            hit = true;
-        }
-        if (ball1_y <= 0.0f) {
-            ball1_y = 0.0f;
-            ball1_vy = -ball1_vy;
-            hit = true;
-        } else if (ball1_y >= PANEL_HEIGHT - kBallSize) {
-            ball1_y = PANEL_HEIGHT - kBallSize;
-            ball1_vy = -ball1_vy;
-            hit = true;
-        }
-        if (hit) {
-            random_color(&ball1_r, &ball1_g, &ball1_b, 80, 176);
-        }
-
-        const float cx = ball1_x + (kBallSize - 1) / 2.0f;
-        const float cy = ball1_y + (kBallSize - 1) / 2.0f;
-        for (int dy = 0; dy < kBallSize; dy++) {
-            for (int dx = 0; dx < kBallSize; dx++) {
-                const float px = ball1_x + dx;
-                const float py = ball1_y + dy;
-                const float ddx = px - cx, ddy = py - cy;
-                if (ddx * ddx + ddy * ddy <= kRadius * kRadius) {
-                    dma_display->drawPixelRGB888(static_cast<int16_t>(px), static_cast<int16_t>(py), ball1_r, ball1_g,
-                                                  ball1_b);
-                }
             }
         }
     };
@@ -3296,233 +3190,6 @@ extern "C" void app_main(void)
         }
     };
 
-    // hub75/si: self-playing, stylized Space Invaders. Formation sweeps
-    // side to side and steps down on each wall hit; player cannon
-    // autonomously tracks the lowest surviving invader's column and
-    // auto-fires; the wave respawns when cleared or once it gets too close
-    // to the player.
-    constexpr int kSiCols = 8;
-    constexpr int kSiRows = 3;
-    constexpr int16_t kSiColSpacing = 7;
-    constexpr int16_t kSiRowSpacing = 4;
-    constexpr int16_t kSiStartX = 4;
-    constexpr int16_t kSiStartY = 2;
-    constexpr int16_t kSiInvaderW = 3;
-    constexpr int16_t kSiInvaderH = 2;
-    bool si_alive[kSiRows][kSiCols];
-    for (int r = 0; r < kSiRows; r++)
-        for (int c = 0; c < kSiCols; c++) si_alive[r][c] = true;
-    int16_t si_formation_x = 0;
-    int16_t si_formation_y = 0;
-    int si_formation_dir = 1;
-    int si_move_tick = 0;
-    int16_t si_player_x = PANEL_WIDTH / 2;
-    bool si_bullet_active = false;
-    int16_t si_bullet_x = 0, si_bullet_y = 0;
-    int si_fire_cooldown = 0;
-
-    auto run_space_invaders_frame = [&]() {
-        constexpr int kSiMoveTicks = 8;          // ~240ms per formation step
-        constexpr int kSiFireCooldownTicks = 20;  // ~600ms between shots
-        constexpr int16_t kSiBulletSpeed = 2;
-
-        if (++si_move_tick >= kSiMoveTicks) {
-            si_move_tick = 0;
-            const int16_t left = kSiStartX + si_formation_x;
-            const int16_t right = kSiStartX + si_formation_x + (kSiCols - 1) * kSiColSpacing + kSiInvaderW;
-            if ((si_formation_dir > 0 && right + 1 >= PANEL_WIDTH) || (si_formation_dir < 0 && left - 1 < 0)) {
-                si_formation_dir = -si_formation_dir;
-                si_formation_y += 2;
-            } else {
-                si_formation_x += si_formation_dir;
-            }
-        }
-
-        bool any_alive = false;
-        for (int r = 0; r < kSiRows && !any_alive; r++) {
-            for (int c = 0; c < kSiCols; c++) {
-                if (si_alive[r][c]) {
-                    any_alive = true;
-                    break;
-                }
-            }
-        }
-        if (!any_alive || kSiStartY + si_formation_y + (kSiRows - 1) * kSiRowSpacing >= 24) {
-            for (int r = 0; r < kSiRows; r++)
-                for (int c = 0; c < kSiCols; c++) si_alive[r][c] = true;
-            si_formation_x = 0;
-            si_formation_y = 0;
-            si_formation_dir = 1;
-        }
-
-        int16_t target_x = si_player_x;
-        for (int r = kSiRows - 1; r >= 0; r--) {
-            bool row_found = false;
-            for (int c = 0; c < kSiCols; c++) {
-                if (si_alive[r][c]) {
-                    target_x = kSiStartX + si_formation_x + c * kSiColSpacing + kSiInvaderW / 2;
-                    row_found = true;
-                    break;
-                }
-            }
-            if (row_found) break;
-        }
-        if (si_player_x < target_x) si_player_x++;
-        else if (si_player_x > target_x) si_player_x--;
-        if (si_player_x < 2) si_player_x = 2;
-        if (si_player_x > PANEL_WIDTH - 3) si_player_x = PANEL_WIDTH - 3;
-
-        if (si_fire_cooldown > 0) si_fire_cooldown--;
-        if (!si_bullet_active && si_fire_cooldown == 0) {
-            si_bullet_active = true;
-            si_bullet_x = si_player_x;
-            si_bullet_y = PANEL_HEIGHT - 5;
-            si_fire_cooldown = kSiFireCooldownTicks;
-        }
-
-        if (si_bullet_active) {
-            si_bullet_y -= kSiBulletSpeed;
-            bool hit = false;
-            for (int r = 0; r < kSiRows && !hit; r++) {
-                for (int c = 0; c < kSiCols; c++) {
-                    if (!si_alive[r][c]) continue;
-                    const int16_t ix = kSiStartX + si_formation_x + c * kSiColSpacing;
-                    const int16_t iy = kSiStartY + si_formation_y + r * kSiRowSpacing;
-                    if (si_bullet_x >= ix && si_bullet_x < ix + kSiInvaderW && si_bullet_y >= iy &&
-                        si_bullet_y < iy + kSiInvaderH) {
-                        si_alive[r][c] = false;
-                        hit = true;
-                        break;
-                    }
-                }
-            }
-            if (hit || si_bullet_y < 0) si_bullet_active = false;
-        }
-
-        for (int r = 0; r < kSiRows; r++) {
-            for (int c = 0; c < kSiCols; c++) {
-                if (!si_alive[r][c]) continue;
-                const int16_t ix = kSiStartX + si_formation_x + c * kSiColSpacing;
-                const int16_t iy = kSiStartY + si_formation_y + r * kSiRowSpacing;
-                dma_display->fillRect(ix, iy, kSiInvaderW, kSiInvaderH, 0, 255, 0);
-            }
-        }
-        dma_display->fillRect(si_player_x - 1, PANEL_HEIGHT - 3, 3, 1, 0, 255, 255);
-        dma_display->drawPixelRGB888(si_player_x, PANEL_HEIGHT - 4, 0, 255, 255);
-        if (si_bullet_active) dma_display->drawPixelRGB888(si_bullet_x, si_bullet_y, 255, 255, 0);
-    };
-
-    // hub75/mi: self-playing, stylized Millipede. A segmented chain weaves
-    // horizontally, reversing and stepping down on hitting a wall or
-    // mushroom, wrapping back to the top once it gets too deep. Body
-    // segments follow a short history of the head's past positions (the
-    // same trailing technique a Snake game would use). Player tracks the
-    // head and auto-fires; the chain respawns once fully cleared.
-    constexpr int kMiSegments = 10;
-    constexpr int kMiHistoryLen = 64;
-    constexpr int kMiSegmentGap = 3;  // history samples between body segments
-    constexpr int kMiMushroomCount = 10;
-    int16_t mi_history_x[kMiHistoryLen];
-    int16_t mi_history_y[kMiHistoryLen];
-    for (int i = 0; i < kMiHistoryLen; i++) {
-        mi_history_x[i] = 4;
-        mi_history_y[i] = 2;
-    }
-    bool mi_alive[kMiSegments];
-    for (int i = 0; i < kMiSegments; i++) mi_alive[i] = true;
-    int16_t mi_head_x = 4, mi_head_y = 2;
-    int mi_dir_x = 1;
-    int mi_move_tick = 0;
-    int16_t mi_mushroom_x[kMiMushroomCount] = {0};
-    int16_t mi_mushroom_y[kMiMushroomCount] = {0};
-    int16_t mi_player_x = PANEL_WIDTH / 2;
-    bool mi_bullet_active = false;
-    int16_t mi_bullet_x = 0, mi_bullet_y = 0;
-    int mi_fire_cooldown = 0;
-
-    auto run_millipede_frame = [&]() {
-        constexpr int kMiMoveTicks = 3;    // ~90ms per step
-        constexpr int16_t kMiMaxY = PANEL_HEIGHT - 6;    // wrap back to top past this depth
-        constexpr int kMiFireCooldownTicks = 16;
-        constexpr int16_t kMiBulletSpeed = 2;
-
-        if (++mi_move_tick >= kMiMoveTicks) {
-            mi_move_tick = 0;
-            const int16_t next_x = static_cast<int16_t>(mi_head_x + mi_dir_x);
-            bool blocked = next_x < 1 || next_x > PANEL_WIDTH - 2;
-            for (int i = 0; i < kMiMushroomCount && !blocked; i++) {
-                if (mi_mushroom_x[i] == next_x && mi_mushroom_y[i] == mi_head_y) blocked = true;
-            }
-            if (blocked) {
-                mi_dir_x = -mi_dir_x;
-                mi_head_y += 2;
-                if (mi_head_y > kMiMaxY) mi_head_y = 2;
-            } else {
-                mi_head_x = next_x;
-            }
-            for (int i = kMiHistoryLen - 1; i > 0; i--) {
-                mi_history_x[i] = mi_history_x[i - 1];
-                mi_history_y[i] = mi_history_y[i - 1];
-            }
-            mi_history_x[0] = mi_head_x;
-            mi_history_y[0] = mi_head_y;
-        }
-
-        bool any_alive = false;
-        for (int i = 0; i < kMiSegments; i++) {
-            if (mi_alive[i]) {
-                any_alive = true;
-                break;
-            }
-        }
-        if (!any_alive) {
-            for (int i = 0; i < kMiSegments; i++) mi_alive[i] = true;
-        }
-
-        const int16_t target_x = mi_history_x[0];
-        if (mi_player_x < target_x) mi_player_x++;
-        else if (mi_player_x > target_x) mi_player_x--;
-        if (mi_player_x < 2) mi_player_x = 2;
-        if (mi_player_x > PANEL_WIDTH - 3) mi_player_x = PANEL_WIDTH - 3;
-
-        if (mi_fire_cooldown > 0) mi_fire_cooldown--;
-        if (!mi_bullet_active && mi_fire_cooldown == 0) {
-            mi_bullet_active = true;
-            mi_bullet_x = mi_player_x;
-            mi_bullet_y = PANEL_HEIGHT - 3;
-            mi_fire_cooldown = kMiFireCooldownTicks;
-        }
-
-        if (mi_bullet_active) {
-            mi_bullet_y -= kMiBulletSpeed;
-            bool hit = false;
-            for (int i = 0; i < kMiSegments && !hit; i++) {
-                if (!mi_alive[i]) continue;
-                const int16_t sx = mi_history_x[i * kMiSegmentGap];
-                const int16_t sy = mi_history_y[i * kMiSegmentGap];
-                if (mi_bullet_x == sx && mi_bullet_y >= sy - 1 && mi_bullet_y <= sy) {
-                    mi_alive[i] = false;
-                    hit = true;
-                }
-            }
-            if (hit || mi_bullet_y < 0) mi_bullet_active = false;
-        }
-
-        for (int i = 0; i < kMiMushroomCount; i++) {
-            dma_display->drawPixelRGB888(mi_mushroom_x[i], mi_mushroom_y[i], 200, 100, 0);
-        }
-        for (int i = 0; i < kMiSegments; i++) {
-            if (!mi_alive[i]) continue;
-            const int16_t sx = mi_history_x[i * kMiSegmentGap];
-            const int16_t sy = mi_history_y[i * kMiSegmentGap];
-            if (i == 0) dma_display->drawPixelRGB888(sx, sy, 255, 0, 0);
-            else dma_display->drawPixelRGB888(sx, sy, 0, 255, 0);
-        }
-        dma_display->fillRect(mi_player_x - 1, PANEL_HEIGHT - 2, 3, 1, 0, 255, 255);
-        dma_display->drawPixelRGB888(mi_player_x, PANEL_HEIGHT - 3, 0, 255, 255);
-        if (mi_bullet_active) dma_display->drawPixelRGB888(mi_bullet_x, mi_bullet_y, 255, 255, 0);
-    };
-
     // hub75/pong: self-playing Pong with a seven-segment scoreboard (see
     // draw_pong_score() above). Paddles track the ball's y position but are
     // speed-capped, so fast returns occasionally get past them and score -
@@ -3534,9 +3201,9 @@ extern "C" void app_main(void)
 
     auto run_pong_frame = [&]() {
         constexpr int16_t kPongCourtTop = 7;
-        constexpr int16_t kPongCourtBottom = PANEL_HEIGHT - 1;
+        const int16_t kPongCourtBottom = static_cast<int16_t>(PANEL_HEIGHT - 1);
         constexpr int16_t kPongPaddleXLeft = 1;
-        constexpr int16_t kPongPaddleXRight = PANEL_WIDTH - 2;
+        const int16_t kPongPaddleXRight = static_cast<int16_t>(PANEL_WIDTH - 2);
         constexpr int16_t kPongPaddleHalfHeight = 3;
         constexpr float kPongPaddleSpeed = 0.6f;
         // Occasional post-bounce speedup so rallies don't settle into an
@@ -3797,8 +3464,13 @@ extern "C" void app_main(void)
     // Both topics share this same generation/solving code - only the path
     // width (and therefore the grid size) differs, configured at runtime by
     // configure_maze() below rather than duplicating the logic.
-    constexpr int kMazeMaxCols = (PANEL_WIDTH - 1) / 2;  // grid size at the narrowest (1px path) config
-    constexpr int kMazeMaxRows = (PANEL_HEIGHT - 1) / 2;
+    // Sized off the largest supported panel (kPanelMaxWidth/Height), not the
+    // live PANEL_WIDTH/PANEL_HEIGHT, since these bound fixed-capacity arrays
+    // below that must fit either panel profile - configure_maze() derives
+    // the actual runtime maze_cols/maze_rows from the live panel size and
+    // clamps them to these maxes.
+    constexpr int kMazeMaxCols = (kPanelMaxWidth - 1) / 2;  // grid size at the narrowest (1px path) config
+    constexpr int kMazeMaxRows = (kPanelMaxHeight - 1) / 2;
     int maze_cols = 0, maze_rows = 0;
     int16_t maze_cell_size = 0, maze_wall_size = 1, maze_cell_pitch = 0;
     int16_t maze_off_x = 0, maze_off_y = 0;
@@ -4412,6 +4084,7 @@ extern "C" void app_main(void)
     uint32_t last_static_key = 0xFFFFFFFFu;
     DisplayMode prev_frame_mode = DisplayMode::kWifiStatus;
 
+
     // Boot splash: up to 4 lines of text from CONFIG_SPLASH_LINE1..4 (menuconfig
     // "HD-WF1 Boot Splash"; the real values live in the gitignored sdkconfig),
     // yellow on black in the 1px-stroke small font, shown for kSplashMs from
@@ -4433,26 +4106,24 @@ extern "C" void app_main(void)
     int splash_drawn_state = -1;  // -1 nothing drawn yet, 0 text only, 1 text + green pixel
 
     // hub75/0: cycles through every pattern above (plus solid colors,
-    // rainbow, flags, and a message) in sequence, forever, until hub75/1
-    // stops it. Reuses the exact same per-frame lambdas/functions as the
-    // standalone modes - only the phase-advance and one-time-per-phase setup
-    // (e.g. regenerating rainbow colors) lives here.
-    enum class AutoPhase { kRed, kGreen, kBlue, kYellow, kOrange, kRainbow, kBars, kPacman, kPixel, kFlagUsa,
-                            kFlagCanada, kMessage, kCount };
+    // rainbow, and a message) in sequence, forever, until hub75/1 stops it.
+    // Reuses the exact same per-frame lambdas/functions as the standalone
+    // modes - only the phase-advance and one-time-per-phase setup (e.g.
+    // regenerating rainbow colors) lives here.
+    enum class AutoPhase { kRed, kGreen, kBlue, kYellow, kOrange, kRainbow, kBars, kPacman, kPixel, kMessage, kCount };
     constexpr int kAutoPhaseDurationTicks[static_cast<int>(AutoPhase::kCount)] = {
         67, 67, 67, 67, 67,  // solids, ~2s each
         100,                 // rainbow, ~3s
         167,                 // bars, ~5s
         267,                 // pacman, ~8s
         167,                 // pixel, ~5s
-        100, 100,            // flags, ~3s each
         167,                 // message, ~5s
     };
     constexpr const char *kAutoTestMessage = "HD-WF1 AUTO TEST";
     int auto_phase = 0;
     int auto_phase_tick = 0;
     bool auto_phase_started = true;  // triggers each phase's one-time setup below
-    uint8_t auto_rainbow_r[PANEL_HEIGHT], auto_rainbow_g[PANEL_HEIGHT], auto_rainbow_b[PANEL_HEIGHT];
+    uint8_t auto_rainbow_r[kPanelMaxHeight], auto_rainbow_g[kPanelMaxHeight], auto_rainbow_b[kPanelMaxHeight];
     int16_t auto_msg_x = PANEL_WIDTH;
     int16_t auto_msg_text_px = 0;
 
@@ -4465,39 +4136,6 @@ extern "C" void app_main(void)
         const ClockTz local_clock_tz = clock_tz;
         const uint8_t local_clock_r = clock_color_r, local_clock_g = clock_color_g, local_clock_b = clock_color_b;
         if (mode != DisplayMode::kClockConfirm) clock_confirm_tick = 0;
-        if (mode != DisplayMode::kStandardTest1) {
-            std1_phase = 0;
-            std1_phase_tick = 0;
-        }
-        if (mode != DisplayMode::kSpaceInvaders) {
-            for (int r = 0; r < kSiRows; r++)
-                for (int c = 0; c < kSiCols; c++) si_alive[r][c] = true;
-            si_formation_x = 0;
-            si_formation_y = 0;
-            si_formation_dir = 1;
-            si_move_tick = 0;
-            si_player_x = PANEL_WIDTH / 2;
-            si_bullet_active = false;
-            si_fire_cooldown = 0;
-        }
-        if (mode != DisplayMode::kMillipede) {
-            mi_head_x = 4;
-            mi_head_y = 2;
-            mi_dir_x = 1;
-            mi_move_tick = 0;
-            for (int i = 0; i < kMiHistoryLen; i++) {
-                mi_history_x[i] = mi_head_x;
-                mi_history_y[i] = mi_head_y;
-            }
-            for (int i = 0; i < kMiSegments; i++) mi_alive[i] = true;
-            for (int i = 0; i < kMiMushroomCount; i++) {
-                mi_mushroom_x[i] = static_cast<int16_t>(2 + esp_random() % (PANEL_WIDTH - 4));
-                mi_mushroom_y[i] = static_cast<int16_t>(6 + esp_random() % 18);
-            }
-            mi_player_x = PANEL_WIDTH / 2;
-            mi_bullet_active = false;
-            mi_fire_cooldown = 0;
-        }
         if (mode != DisplayMode::kPong) {
             pong_left_score = 0;
             pong_right_score = 0;
@@ -4522,14 +4160,7 @@ extern "C" void app_main(void)
             matrix_cont_tick = 0;
         }
         if (mode != DisplayMode::kMatrixRain) {
-            for (int c = 0; c < kMatrixRainCols; c++) reset_matrix_rain_column(c, true);
-        }
-        if (mode != DisplayMode::kBall1) {
-            ball1_x = (PANEL_WIDTH - 8) / 2.0f;
-            ball1_y = (PANEL_HEIGHT - 8) / 2.0f;
-            ball1_vx = (esp_random() % 2) ? 0.8f : -0.8f;
-            ball1_vy = (esp_random() % 2) ? 0.6f : -0.6f;
-            random_color(&ball1_r, &ball1_g, &ball1_b, 80, 176);
+            for (int c = 0; c < PANEL_WIDTH / kSmallFontAdvance; c++) reset_matrix_rain_column(c, true);
         }
         if (mode != DisplayMode::kShootingStars) {
             for (int s = 0; s < kStarCount; s++) {
@@ -4590,19 +4221,13 @@ extern "C" void app_main(void)
         }
         const double local_ping2_rtt_ms = ping2_last_rtt_ms;
         uint8_t local_solid_r = solid_r, local_solid_g = solid_g, local_solid_b = solid_b;
-        uint8_t local_f1300l_fg[3], local_f1300l_bg[3], local_f1300l_hue[3];
-        memcpy(local_f1300l_fg, f1300l_fg, 3);
-        memcpy(local_f1300l_bg, f1300l_bg, 3);
-        memcpy(local_f1300l_hue, f1300l_hue, 3);
-        const uint8_t local_ray_sphere_r = ray_sphere_r, local_ray_sphere_g = ray_sphere_g,
-                      local_ray_sphere_b = ray_sphere_b;
-        const uint8_t local_ray2_sphere2_r = ray2_sphere2_r, local_ray2_sphere2_g = ray2_sphere2_g,
-                      local_ray2_sphere2_b = ray2_sphere2_b;
-        const uint8_t local_ray_floor1_r = ray_floor1_r, local_ray_floor1_g = ray_floor1_g,
-                      local_ray_floor1_b = ray_floor1_b;
-        const uint8_t local_ray_floor2_r = ray_floor2_r, local_ray_floor2_g = ray_floor2_g,
-                      local_ray_floor2_b = ray_floor2_b;
-        uint8_t local_rainbow_r[PANEL_HEIGHT], local_rainbow_g[PANEL_HEIGHT], local_rainbow_b[PANEL_HEIGHT];
+        char local_number_digits[kNumberLMaxDigits + 1];
+        uint8_t local_number_fg[3], local_number_bg[3], local_number_hue[3];
+        memcpy(local_number_digits, number_l_digits, sizeof(local_number_digits));
+        memcpy(local_number_fg, number_l_fg, 3);
+        memcpy(local_number_bg, number_l_bg, 3);
+        memcpy(local_number_hue, number_l_hue, 3);
+        uint8_t local_rainbow_r[kPanelMaxHeight], local_rainbow_g[kPanelMaxHeight], local_rainbow_b[kPanelMaxHeight];
         memcpy(local_rainbow_r, rainbow_row_r, sizeof(local_rainbow_r));
         memcpy(local_rainbow_g, rainbow_row_g, sizeof(local_rainbow_g));
         memcpy(local_rainbow_b, rainbow_row_b, sizeof(local_rainbow_b));
@@ -4621,22 +4246,33 @@ extern "C" void app_main(void)
         display_dirty = false;
         xSemaphoreGive(display_mutex);
 
+        // Onboard button: a short press reboots the board on release. A long
+        // press (>=kButtonLongPressTicks held) instead wakes
+        // gateway_ping_task() to ping the default gateway and blink the
+        // lower-right pixel (see the overlay draw near the end of this
+        // loop) - ignored if a sequence is already running. Both fire
+        // regardless of the active display mode.
+        {
+            const bool button_raw = gpio_get_level(static_cast<gpio_num_t>(WF1_BUTTON_PIN)) != 0;  // true = unpressed
+            if (!button_raw) {
+                button_hold_ticks++;
+            } else {
+                if (button_prev_raw == false) {  // just released
+                    if (button_hold_ticks >= kButtonLongPressTicks) {
+                        if (!gateway_ping_active) xSemaphoreGive(gateway_ping_trigger);
+                    } else {
+                        ESP_LOGI(TAG, "button short press: rebooting");
+                        esp_restart();
+                    }
+                }
+                button_hold_ticks = 0;
+            }
+            button_prev_raw = button_raw;
+        }
+
         if (wanted_brightness != applied_brightness) {
             applied_brightness = wanted_brightness;
             dma_display->setBrightness8(applied_brightness);
-        }
-
-        // Onboard button: short press advances hub75/standardtest1 to its
-        // next phase immediately (resetting that phase's dwell timer), so it
-        // can be driven by hand at the panel instead of waiting out the
-        // automatic ~2s/phase timer. No effect in any other mode.
-        {
-            const bool button_raw = gpio_get_level(static_cast<gpio_num_t>(WF1_BUTTON_PIN)) != 0;  // true = unpressed
-            if (button_prev_raw && !button_raw && mode == DisplayMode::kStandardTest1) {
-                std1_phase = (std1_phase + 1) % 8;
-                std1_phase_tick = 0;
-            }
-            button_prev_raw = button_raw;
         }
 
         if (!splash_over) {
@@ -4669,7 +4305,7 @@ extern "C" void app_main(void)
                                       mode == DisplayMode::kFixed1300 || mode == DisplayMode::kFixed1300Alt ||
                                       mode == DisplayMode::kFixed1300B || mode == DisplayMode::kFixed1300C ||
                                       mode == DisplayMode::kFixed1300D || mode == DisplayMode::kFixed1300E ||
-                                      mode == DisplayMode::kFixed1300F || mode == DisplayMode::kFixed1300L ||
+                                      mode == DisplayMode::kFixed1300F || mode == DisplayMode::kNumberL ||
                                       mode == DisplayMode::kFixed1300LI ||
                                       mode == DisplayMode::kFixed13 || mode == DisplayMode::kFixed00);
             if (static_mode) {
@@ -4677,13 +4313,23 @@ extern "C" void app_main(void)
                 key ^= (static_cast<uint32_t>(local_solid_r) << 16) | (static_cast<uint32_t>(local_solid_g) << 8) |
                        static_cast<uint32_t>(local_solid_b);
                 key ^= static_cast<uint32_t>(applied_brightness) << 24;
-                if (mode == DisplayMode::kFixed1300L) {  // colours from the payload
+                if (mode == DisplayMode::kNumberL) {  // digits + colours from the payload
+                    for (const char *c = local_number_digits; *c; c++) key = key * 16777619u ^ static_cast<uint8_t>(*c);
                     for (int i = 0; i < 3; i++)
-                        key = key * 16777619u ^ (static_cast<uint32_t>(local_f1300l_fg[i]) << 16 |
-                                                 static_cast<uint32_t>(local_f1300l_bg[i]) << 8 |
-                                                 static_cast<uint32_t>(local_f1300l_hue[i]));
+                        key = key * 16777619u ^ (static_cast<uint32_t>(local_number_fg[i]) << 16 |
+                                                 static_cast<uint32_t>(local_number_bg[i]) << 8 |
+                                                 static_cast<uint32_t>(local_number_hue[i]));
                 }
                 if (key == last_static_key) {
+                    // Still mirror the gateway-ping overlay (see near
+                    // flipDMABuffer() below) even though the rest of the
+                    // frame is being skipped as unchanged - otherwise a
+                    // long-press during a static mode would never blink.
+                    if (gateway_ping_active) {
+                        dma_display->drawPixelRGB888(PANEL_WIDTH - 1, PANEL_HEIGHT - 1, 0,
+                                                      gateway_ping_pixel_on ? 255 : 0, 0);
+                        dma_display->flipDMABuffer();
+                    }
                     vTaskDelay(pdMS_TO_TICKS(30));
                     continue;  // already on screen, unchanged
                 }
@@ -4709,6 +4355,13 @@ extern "C" void app_main(void)
         } else {
             blink_tick = 0;
         }
+
+        // hub75/1300's geometry depends on the live panel size (see
+        // kFixed1300Scale/CharW/TextW above), so it's recomputed every tick
+        // rather than baked in as a file-scope constant - cheap arithmetic,
+        // and it stays correct across a panel-profile switch.
+        const int16_t kFixed1300X = static_cast<int16_t>((PANEL_WIDTH - kFixed1300TextW) / 2);
+        const int16_t kFixed1300Y = static_cast<int16_t>((PANEL_HEIGHT - kFixed1300CharW) / 2);
 
         if (blink_visible) switch (mode) {
             case DisplayMode::kMessage:
@@ -4768,15 +4421,15 @@ extern "C" void app_main(void)
                                   kFixed1300Scale, kFixed1300Grey, kFixed1300Grey, kFixed1300Grey, true);
                 break;
 
-            case DisplayMode::kFixed1300L:
-                draw_chilanka_1300(local_f1300l_fg, local_f1300l_bg, local_f1300l_hue);
+            case DisplayMode::kNumberL:
+                draw_chilanka_number(local_number_digits, local_number_fg, local_number_bg, local_number_hue);
                 break;
 
             case DisplayMode::kFixed1300LI: {
                 static const uint8_t kBlack[3] = {0, 0, 0};
                 static const uint8_t kTan[3] = {kFixed1300LIBgR, kFixed1300LIBgG, kFixed1300LIBgB};
                 static const uint8_t kNoHue[3] = {255, 255, 255};
-                draw_chilanka_1300(kBlack, kTan, kNoHue);
+                draw_chilanka_number("1300", kBlack, kTan, kNoHue);
                 break;
             }
 
@@ -4869,66 +4522,6 @@ extern "C" void app_main(void)
                 break;
             }
 
-            case DisplayMode::kRayTrace: {
-                const RtSphere spheres[1] = {
-                    {{0.0f, 0.0f, 4.0f}, 1.2f, local_ray_sphere_r, local_ray_sphere_g, local_ray_sphere_b},
-                };
-                draw_raytracer(spheres, 1, RtVec3{0.0f, 0.0f, 4.0f}, -1.2f, local_ray_floor1_r, local_ray_floor1_g,
-                                local_ray_floor1_b, local_ray_floor2_r, local_ray_floor2_g, local_ray_floor2_b);
-                break;
-            }
-
-            case DisplayMode::kRayTrace2: {
-                const RtSphere spheres[2] = {
-                    {{-1.3f, 0.0f, 4.3f}, 1.0f, local_ray_sphere_r, local_ray_sphere_g, local_ray_sphere_b},
-                    {{1.3f, 0.0f, 4.7f}, 1.0f, local_ray2_sphere2_r, local_ray2_sphere2_g, local_ray2_sphere2_b},
-                };
-                draw_raytracer(spheres, 2, RtVec3{0.0f, 0.0f, 4.5f}, -1.1f, local_ray_floor1_r, local_ray_floor1_g,
-                                local_ray_floor1_b, local_ray_floor2_r, local_ray_floor2_g, local_ray_floor2_b);
-                break;
-            }
-
-            case DisplayMode::kStandardTest1: {
-                struct Std1Phase {
-                    uint8_t r, g, b, brightness;
-                    const char *name;
-                };
-                static constexpr Std1Phase kStd1Phases[8] = {
-                    {255, 255, 255, kDimBrightness, "white dim"},
-                    {255, 255, 255, kFullBrightness, "white bright"},
-                    {255, 0, 0, kDimBrightness, "red dim"},
-                    {255, 0, 0, kFullBrightness, "red bright"},
-                    {0, 255, 0, kDimBrightness, "green dim"},
-                    {0, 255, 0, kFullBrightness, "green bright"},
-                    {0, 0, 255, kDimBrightness, "blue dim"},
-                    {0, 0, 255, kFullBrightness, "blue bright"},
-                };
-                constexpr int kStd1PhaseTicks = 67;  // ~2s/phase
-                const Std1Phase &phase = kStd1Phases[std1_phase];
-                if (std1_phase_tick == 0) {
-                    set_brightness(phase.brightness);
-                    ESP_LOGI(TAG, "hub75/standardtest1: phase %d/8 - %s", std1_phase + 1, phase.name);
-                }
-                dma_display->fillScreenRGB888(phase.r, phase.g, phase.b);
-                // Phase number in black (0,0,0 - LEDs off) so it reads
-                // against any of the fill colors above, including white.
-                char phase_label[2] = {static_cast<char>('1' + std1_phase), '\0'};
-                draw_text(1, 1, phase_label, 0, 0, 0);
-                if (++std1_phase_tick >= kStd1PhaseTicks) {
-                    std1_phase_tick = 0;
-                    std1_phase = (std1_phase + 1) % 8;
-                }
-                break;
-            }
-
-            case DisplayMode::kSpaceInvaders:
-                run_space_invaders_frame();
-                break;
-
-            case DisplayMode::kMillipede:
-                run_millipede_frame();
-                break;
-
             case DisplayMode::kPong:
                 run_pong_frame();
                 break;
@@ -4983,10 +4576,6 @@ extern "C" void app_main(void)
                 run_matrix_rain_frame();
                 break;
 
-            case DisplayMode::kBall1:
-                run_ball1_frame();
-                break;
-
             case DisplayMode::kShootingStars:
                 run_shootingstars_frame();
                 break;
@@ -5011,12 +4600,19 @@ extern "C" void app_main(void)
                 // column marking a timed-out ping. The bottom kSmallFontHeight
                 // rows are reserved for the numeric readout below, so the
                 // graph itself only ever grows into the rows above that.
-                constexpr int16_t kGraphBaselineY = PANEL_HEIGHT - kSmallFontHeight - 2;  // 1px gap above the text
-                constexpr int16_t kGraphMaxHeight = kGraphBaselineY + 1;
+                const int16_t kGraphBaselineY = static_cast<int16_t>(PANEL_HEIGHT - kSmallFontHeight - 2);  // 1px gap above the text
+                const int16_t kGraphMaxHeight = static_cast<int16_t>(kGraphBaselineY + 1);
                 constexpr double kGraphMaxMs = 100.0;  // latency at/above this fills the graph to the top
-                for (int x = 0; x < kPing1GraphWidth; x++) {
+                // local_ping1_graph_ms always holds kPing1GraphWidth
+                // (kPanelMaxWidth) samples regardless of the active profile;
+                // only the most recent PANEL_WIDTH columns are drawn, mapped
+                // to pixel columns 0..PANEL_WIDTH-1, so a narrower panel just
+                // shows the newest slice of the same scrolling history.
+                const int graph_start = kPing1GraphWidth - PANEL_WIDTH;
+                for (int x = graph_start; x < kPing1GraphWidth; x++) {
                     const uint16_t sample = local_ping1_graph_ms[x];
                     if (sample == 0) continue;  // no sample scrolled into this column yet
+                    const int16_t px = static_cast<int16_t>(x - graph_start);
                     uint8_t r, g, b;
                     int16_t height;
                     if (sample == kPing1Timeout) {
@@ -5046,7 +4642,7 @@ extern "C" void app_main(void)
                         if (height < 1) height = 1;
                         if (height > kGraphMaxHeight) height = kGraphMaxHeight;
                     }
-                    dma_display->fillRect(static_cast<int16_t>(x), static_cast<int16_t>(kGraphBaselineY - height + 1),
+                    dma_display->fillRect(px, static_cast<int16_t>(kGraphBaselineY - height + 1),
                                            1, height, r, g, b);
                 }
 
@@ -5081,14 +4677,6 @@ extern "C" void app_main(void)
             case DisplayMode::kPing2:
                 run_ping2_frame(local_ping2_launch_pending, local_ping2_timed_out, local_ping2_r, local_ping2_g,
                                  local_ping2_b, local_ping2_frames, local_ping2_rtt_ms);
-                break;
-
-            case DisplayMode::kFlagUsa:
-                draw_flag_usa();
-                break;
-
-            case DisplayMode::kFlagCanada:
-                draw_flag_canada();
                 break;
 
             case DisplayMode::kElevator:
@@ -5156,12 +4744,6 @@ extern "C" void app_main(void)
                     case AutoPhase::kPixel:
                         run_test1_frame();
                         break;
-                    case AutoPhase::kFlagUsa:
-                        draw_flag_usa();
-                        break;
-                    case AutoPhase::kFlagCanada:
-                        draw_flag_canada();
-                        break;
                     case AutoPhase::kMessage:
                     default:
                         if (auto_phase_started) {
@@ -5177,6 +4759,16 @@ extern "C" void app_main(void)
                 auto_phase_started = false;
                 break;
             }
+        }
+
+        // Onboard button's long-press gateway ping (see gateway_ping_task()
+        // and the button handling above): drawn every tick, on top of
+        // whatever the mode switch above just rendered, for as long as a
+        // sequence is running - unlike the static/maze/mode-drawing paths
+        // above, this can't rely on redrawing only on change, since it must
+        // win over modes that clear + redraw the whole panel every frame.
+        if (gateway_ping_active) {
+            dma_display->drawPixelRGB888(PANEL_WIDTH - 1, PANEL_HEIGHT - 1, 0, gateway_ping_pixel_on ? 255 : 0, 0);
         }
 
         dma_display->flipDMABuffer();

@@ -5,8 +5,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 ESP-IDF firmware for a **Huidu HD-WF1** control card (ESP32-S2, 4MB flash, no
-PSRAM) driving a 128×64 HUB75E RGB LED matrix panel. It renders a large set of
-MQTT-triggered patterns/animations/effects (scrolling text, games, clocks,
+PSRAM) driving a HUB75E RGB LED matrix panel — either a 128×64 or a 64×32
+panel, chosen by a menuconfig choice (see "Panel profiles" below). It
+renders a large set of MQTT-triggered patterns/animations/effects (scrolling
+text, games, clocks,
 network-latency visualizations, mazes, etc.) — see the topic table in
 `README.md` for the full, current list; don't try to re-derive it from memory,
 it changes often.
@@ -74,7 +76,7 @@ checkouts.
 
 ### One giant `main/main.cpp`
 
-There is a single active source file, ~4500 lines, selected by
+There is a single active source file, ~5100 lines, selected by
 `CONFIG_HUB75_BACKEND_ARDUINO_GFX` in `sdkconfig.defaults` (misleadingly
 named — it's neither Arduino nor GFX; built with `ESP32_HUB75_USE_GFX=n`).
 `main_native.cpp`/`font5x7.{h,cpp}` are dead code from an earlier
@@ -144,16 +146,113 @@ message/static text/solid colours/dim-bright/clocks/`shootingstars`/`time`/
 ~25 KB of heap. A new topic that should be live in the lean build must not be
 inside a `HUB75_FULL_EFFECTS` block in the subscribe list.
 
+### Command dispatch: one wildcard subscribe, one shared `dispatch_command()`
+
+MQTT subscribes to a single topic filter (plus the configured message topic
+if it lives outside `hub75/`), not one subscription per topic — see the
+comment at `mqtt_event_handler`'s `MQTT_EVENT_CONNECTED` case. Every inbound
+message (MQTT or REST) is routed through one function,
+`dispatch_command(topic, topic_len, data, data_len)`, which does its own
+`else if (topic_matches(...))` chain and returns false for anything
+unrecognised (including topics gated out by `HUB75_FULL_EFFECTS`) — the REST
+API (`http_api_init`, below) calls the exact same function, so MQTT and HTTP
+control paths can't drift apart and a new topic needs no separate REST
+touch point.
+
+`dispatch_command()`/`topic_matches()`/every `kXTopic` constant/
+`CONFIG_MQTT_STATUS_TOPIC`/`CONFIG_MQTT_MESSAGE_TOPIC` only ever see
+canonical, un-prefixed `hub75/...` strings — REST always built that form
+directly anyway, and MQTT normalizes into it too when
+`CONFIG_MQTT_TOPIC_MAC_PREFIX` (default on) is namespacing the wire-level
+topics as `hub75/<device_id_hex>/...` so multiple boards can share one
+broker. `mqtt_topic_ns`/`mqtt_wire_status_topic`/`mqtt_wire_message_topic`
+(built once in `mqtt_init()`, before the client starts) hold the actual wire
+forms; `mqtt_build_wire_topic()` translates canonical → wire (for
+subscribing/publishing) and `mqtt_normalize_topic()` translates wire →
+canonical (applied to every `MQTT_EVENT_DATA` topic before it reaches
+`dispatch_command()`) — these two functions are the only place that need to
+know the scheme is active. `device_id_hex` (this device's WiFi station MAC
+as 12 lowercase hex digits) is computed once by `compute_device_id()`, early
+in `app_main()`, via `esp_read_mac()` — that works before WiFi ever starts,
+since it's derived arithmetically from the efuse-burned base MAC rather than
+read from the running driver.
+
 ### Adding a new `hub75/<topic>` MQTT command
 
 Follow the existing convention exactly (grep any existing topic, e.g.
-`kMaze1Topic` or `kFixed1300LTopic`, for the full set of touch points): a `DisplayMode` enum value,
-a `constexpr const char *kXTopic` constant, a subscribe call, an
-`else if (topic_matches(...))` dispatch branch calling `set_test_mode()` (or
-a custom setup block if the mode needs one-time state reset), and a `case` in
-the render loop's big `switch`. Update `README.md`'s topic table and the
+`kMaze1Topic` or `kFixed1300Topic`, for the full set of touch points — or
+`kNumberL`/`draw_chilanka_number` for the pattern an open-ended numeric
+topic like `hub75/nn`-`nnnnnn[L]` uses instead of a fixed topic string): a
+`DisplayMode` enum value, a `constexpr const char *kXTopic` constant, an
+`else if (topic_matches(...))` branch inside `dispatch_command()` calling
+`set_test_mode()` (or a custom setup block if the mode needs one-time state
+reset), and a `case` in the render loop's big `switch`. No subscribe call or
+REST wiring needed — both are covered by the wildcard subscribe and the
+shared dispatch function above. Update `README.md`'s topic table and the
 catch-all "replaces whatever was showing" topic list in the same change —
 they're the actual user-facing documentation and go stale easily.
+
+### REST API (`CONFIG_HTTP_API_ENABLE`, optional)
+
+`http_api_init` starts an `esp_http_server` once WiFi connects, exposing
+`POST /api/command/<name>` (body = the MQTT payload, may be empty) and
+`GET /api/status` — or, when `CONFIG_HTTP_API_MAC_PREFIX` (default on) is
+set, `POST /api/<device_id_hex>/command/<name>` and
+`GET /api/<device_id_hex>/status` instead; `http_command_prefix`/
+`http_status_path` (built once in `http_api_init()`, before routes are
+registered) hold whichever form is active, and `httpd_register_uri_handler`
+`strdup()`s the `.uri` pattern immediately so a stack-local buffer used only
+during registration is safe. This setting is independent of
+`CONFIG_MQTT_TOPIC_MAC_PREFIX` above (same `device_id_hex`/hex format, but
+either can be on or off regardless of the other). `<name>` is the topic
+without the `hub75/` prefix; the handler builds `hub75/<name>` and calls
+`dispatch_command()` directly (see above), so it automatically supports
+every current and future topic with no separate code path to maintain —
+don't add per-command REST handlers. Auth is an optional bearer token
+(`CONFIG_HTTP_API_TOKEN`), checked in `http_authorized`. Payloads are JSON
+parsed with cJSON (`espressif/cjson` component), same as MQTT payloads.
+
+### Panel profiles: menuconfig geometry/pin selection (`PanelProfile`)
+
+Two physical panels are supported, chosen by a menuconfig choice
+(`CONFIG_PANEL_RESOLUTION_128X64`/`_64X32`, 'HD-WF1 Panel' → 'Panel
+resolution', default 128×64) — fixed at build time, not a runtime switch (an
+earlier version of this feature was NVS-persisted and toggled by a
+long-press of the onboard button; that was removed when the button was
+repurposed — see "Onboard button" below — in favor of picking the panel at
+build time instead). `PANEL_WIDTH`/`PANEL_HEIGHT` (and the R/G/B pin
+variables `active_r1_pin` etc.) are runtime globals, not `#define`s — set
+once by `init_display()` at boot from whichever `PanelProfile`
+(`kProfile128x64`/`kProfile64x32`, near the `WF1_*_PIN` defines) menuconfig
+selected. `kPanelMaxWidth`/`kPanelMaxHeight` (128/64) are the true
+compile-time constants; anything that needs a fixed-size array sized by
+panel dimensions (maze buffers, the ping1 graph, matrix rain columns,
+rainbow rows) is sized off those maxes and clamped to the *live* dimensions
+at runtime, not off `PANEL_WIDTH`/`PANEL_HEIGHT` directly — follow that
+pattern (already used by the maze solver before this feature existed) for
+any new panel-size-dependent fixed buffer.
+
+`init_display(profile)` builds and starts `dma_display` for the selected
+profile; it's called exactly once, from `app_main()`, before the render loop
+starts — there is no runtime re-init path.
+
+### Onboard button
+
+GPIO 11 (`WF1_BUTTON_PIN`), active-low. A short press calls `esp_restart()`
+on release — an instant physical reboot with no console/network needed. A
+long press (`kButtonLongPressTicks`, ~1s held) instead wakes
+`gateway_ping_task()` (a background FreeRTOS task, following the same
+"network I/O never runs inline in the render loop" rule as the ping1/ping2
+tasks — see "Ping infrastructure" below) to ping the current default gateway
+(via `wifi_sta_netif`, `esp_netif_get_ip_info()`'s `.gw`) 5 times, blinking
+the lower-right pixel green for each packet (`gateway_ping_active`/
+`gateway_ping_pixel_on`, plain `volatile bool`s — single writer, the task;
+single reader, the render loop) then leaving it off. Both actions fire
+regardless of the active `display_mode`. The render loop draws the blink
+overlay itself, every tick, right before `flipDMABuffer()` — and separately
+inside the static-mode fast path's "unchanged, skip redraw" branch too (see
+"Render loop draw conventions" above), since without that second draw call
+a long-press during a static mode (e.g. a solid color) would never blink.
 
 ### Ping infrastructure (`hub75/ping1`, `hub75/ping2`, `hub75/maze4`/`maze5`)
 
@@ -195,22 +294,24 @@ bootloader; erase the region before a fresh run). Crash dumps: read the
 
 ## Hardware notes
 
-- **Panel size**: the panel is 128×64 (`PANEL_WIDTH`/`PANEL_HEIGHT` in
-  `main/main.cpp`; it was 64×32 originally, so older comments/README text may
-  still mention 64×32). Most layout code derives from those macros; fixed-pixel
-  sprites/fonts are the same size as before. `partitions.csv` also has the
-  `applog` (0x120000, 64K) partition.
+- **Panel size**: 128×64 or 64×32, chosen by a menuconfig choice (see "Panel
+  profiles" above) — `PANEL_WIDTH`/`PANEL_HEIGHT` in `main/main.cpp` are
+  runtime globals reflecting whichever was selected, not `#define`s. Most
+  layout code derives from those globals; fixed-pixel sprites/fonts are the
+  same size as before. `partitions.csv` also has the `applog` (0x120000,
+  64K) partition.
 - `partitions.csv` is a custom layout (1M factory app, 64K coredump); the
   `RootCause.md` file at the repo root holds the detailed bring-up debugging
   notes referenced by `README.md`.
 
 - **Pinout**: reverse-engineered by the community, but the **R/G/B channels
-  are re-pinned per panel** (confirmed via solid-colour tests): the current
-  128×64 panel needed R=3/5, G=6/8, B=2/4 (source order lit red→blue,
-  green→red, blue→green); the old 64×32 panel only needed G/B swapped. If
-  colours look wrong after a panel change, fix the pin `#define`s in
-  `main/main.cpp`, not the drawing code — see the Pinout section of
-  `README.md`.
+  are re-pinned per panel** (confirmed via solid-colour tests): the 128×64
+  panel needs R=3/5, G=6/8, B=2/4 (source order lit red→blue, green→red,
+  blue→green); the 64×32 panel needs R=2/4, G=3/5, B=6/8 (recovered from this
+  project's first commit). Both are baked in as `kProfile128x64`/
+  `kProfile64x32` in `main/main.cpp` — a genuinely new (third) panel needs
+  its pin `#define`s/profile fixed there, not in the drawing code — see the
+  Pinout section of `README.md`.
 - Full bring-up war story (bootloader strap confusion, a dead HUB75 library,
   the color-channel swap, a power-supply issue that looked like a firmware
   bug, a clock-integrity glitch) is in `README.md`'s "Root cause history" —
