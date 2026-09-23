@@ -867,7 +867,18 @@ void wifi_init(void) {
   if (strlen(CONFIG_WIFI_SSID) == 0) {
     ESP_LOGI(WIFI_TAG, "CONFIG_WIFI_SSID empty, skipping WiFi init");
     xSemaphoreTake(display_mutex, portMAX_DELAY);
-    display_mode = DisplayMode::kMessage;  // nothing will ever connect - show the default message instead
+    // Stay on kWifiStatus (its boot-default value) rather than falling
+    // through to kMessage, so this stays on screen instead of looking like
+    // normal idle operation - nothing will ever connect without an SSID.
+    strlcpy(status_lines[0].text, "No WiFi", kMaxStatusLineLen);
+    status_lines[0].r = 255;
+    status_lines[0].g = 0;
+    status_lines[0].b = 0;
+    strlcpy(status_lines[1].text, "configured", kMaxStatusLineLen);
+    status_lines[1].r = 255;
+    status_lines[1].g = 0;
+    status_lines[1].b = 0;
+    status_line_count = 2;
     xSemaphoreGive(display_mutex);
     return;
   }
@@ -1694,6 +1705,14 @@ esp_err_t http_status_handler(httpd_req_t *req) {
 
 void http_api_init(void) {
 #if CONFIG_HTTP_API_ENABLE
+  // wifi_init() skips esp_netif_init() entirely when WiFi is unconfigured,
+  // so LwIP's tcpip thread never starts - httpd_start() below would then
+  // assert (tcpip_send_msg_wait_sem: Invalid mbox) and panic-loop the board.
+  if (strlen(CONFIG_WIFI_SSID) == 0) {
+    ESP_LOGI(HTTP_TAG, "CONFIG_WIFI_SSID empty, skipping HTTP API init");
+    return;
+  }
+
   // http_command_prefix/http_status_path must be ready before routes are
   // registered below, and before any request can arrive.
 #if CONFIG_HTTP_API_MAC_PREFIX
