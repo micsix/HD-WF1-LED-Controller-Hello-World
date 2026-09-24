@@ -159,7 +159,10 @@ what `small_font_glyph()` defines - add any missing letters there.)
 All are optional and off by default. Configure via `idf.py menuconfig`:
 
 - **HD-WF1 WiFi** — SSID/password. Leave the SSID empty to skip WiFi
-  entirely (the panel just shows the default scrolling message).
+  entirely - the panel shows "No WiFi configured" in red instead of ever
+  reaching the WiFi-status/MQTT-driven screens below (nothing will ever
+  connect without an SSID, so the REST API and MQTT are skipped too rather
+  than crash-looping trying to reach a network stack that never came up).
 - **HD-WF1 MQTT** — broker URI/username/password/client ID, the status and
   message topic names (defaults below), and whether topics are prefixed with
   this device's WiFi MAC (default on - see [MQTT topics](#mqtt-topics)).
@@ -168,7 +171,31 @@ All are optional and off by default. Configure via `idf.py menuconfig`:
   un-prefixed form (e.g. `hub75/status`) - there's no `<mac>` placeholder to
   fill in here, since the MAC isn't known until boot; when the MAC-prefix
   setting above is on, it's spliced into the wire topic automatically at
-  runtime.
+  runtime. The client ID field is just a short prefix (default
+  `hd-wf1-hub75`) - this device's WiFi MAC is always appended to it as
+  `-<mac>` at runtime, unconditionally (not tied to the MAC-prefix setting
+  above), so the exact same build/`sdkconfig` can be flashed onto multiple
+  boards sharing one broker without their client IDs colliding - MQTT
+  requires unique client IDs per broker, and a collision silently
+  disconnects the older board rather than erroring loudly. Don't add your
+  own unique suffix here.
+- **HD-WF1 Default Text** — what the panel shows (`DisplayMode::kMessage`)
+  before any `hub75/message` command has ever arrived, and how it's
+  rendered:
+  - **Default text to display** — plain text, default empty (blank
+    screen/scroll). Overwritten for good by the first real `hub75/message`
+    received that boot - there's no way back to this default without a
+    reboot.
+  - **Default text font** — 8x8 (default; full ASCII, scrolls) or a compact
+    3x5 font (fits without scrolling, but only covers digits/space/`.`/`=`
+    and the specific letters the WiFi-status screen needs - anything else
+    renders as blank space). This is a build-time choice that applies to
+    every `hub75/message`, not just the boot default, since both share the
+    same renderer.
+  - **Default text foreground/background color** — `#RRGGBB` hex, default
+    green-on-black (`#00FF00`/`#000000`), same format as other `hub75/*`
+    JSON color fields. An invalid or empty value falls back to those
+    defaults at boot.
 - **HD-WF1 REST API** — enable (default on), port (default 80), an optional
   bearer token, and whether paths are prefixed with this device's WiFi MAC
   (default on, independent of the MQTT setting above); see
@@ -196,17 +223,29 @@ committed.
 
 The panel starts dim by default (as if `hub75/dim` had already been sent) -
 the very first thing it draws comes up gentle rather than at full
-brightness; send `hub75/bright` at any time to go to 100%. Before WiFi
-starts, the panel briefly shows the previous boot's reset reason ("RR=n").
-While connecting, it then shows live WiFi status ("Not Connected" /
-"Retrying..." / attempt count in red, then "Connected" + IP in green/yellow +
-"Topic: hub75/" in white, or "Topic: hub75/<mac>/" when *HD-WF1 MQTT →
-Prefix hub75/ topics with this device's WiFi MAC* is on) until the first
-MQTT message arrives, after which it switches to showing MQTT-driven content
-permanently. These displays use a compact 3px-wide font and are centered
-statically (no scrolling); on the 128×64 panel everything fits at once, but
-the MAC-prefixed topic line is long enough to overflow the 64×32 panel's
-width.
+brightness; send `hub75/bright` at any time to go to 100%. For the first 2s
+it shows "RR=n" in white (`esp_reset_reason()`'s value - notably `4` means
+the *previous* boot ended in a panic, e.g. from a crash loop) so a reboot
+reason is visible on the panel itself without pulling the applog; this is a
+render-loop overlay only, so it doesn't delay WiFi/MQTT coming up
+concurrently underneath it. Then, if any *HD-WF1 Boot Splash* lines are
+configured, up to 10s of that (also non-blocking) before showing live WiFi
+status - "Not Connected" /
+"Retrying..." / attempt count in red (3 lines), then once connected
+"Connected" (green) / the IP address (yellow) / "Topic: hub75/" / this
+device's WiFi MAC (white, 4 lines - the MAC gets its own line rather than
+being appended to the topic line, since it's also the REST API's path
+prefix and useful for network discovery regardless of *HD-WF1 MQTT → Prefix
+hub75/ topics with this device's WiFi MAC*) - until the first MQTT message
+arrives, after which it switches to showing MQTT-driven content permanently.
+These displays use a compact 3px-wide font and are both horizontally and
+vertically centered as a block (no scrolling), computed against the live
+panel height so they stay centered on both the 128×64 and 64×32 profiles. If
+nothing arrives within 15s of connecting, it falls back on its own to the
+equivalent of `hub75/1300L` with `{"fg":"#df6f3f","bg":"#000000","hue":"#555555"}`
+(a dim burnt-orange "1300" on black) rather than sitting on the WiFi status
+screen indefinitely - a real message before then cancels this, same as any
+other topic moving `DisplayMode` past `kWifiStatus`.
 
 ### REST API
 
@@ -296,7 +335,6 @@ router's client list.
 | `hub75/test1` | any | One random pixel per ~210ms, smoothly fading in and out (no hard blink/dark gap), continuously. |
 | `hub75/test2` | any | Animated 10-bar vertical bar graph, one fixed color per bar, random heights refreshed ~4x/sec. |
 | `hub75/test3` | any | 8x8 pacman sprite chomping its way around the panel perimeter. |
-| `hub75/rainbow` | any | One random solid color per row (32 horizontal lines), regenerated fresh each time this fires. |
 | `hub75/off` | any | Blanks the panel. |
 | `hub75/1300` | any | Static "1300", grey on black, at the largest integer scale of the built-in 8x8 font that still fits all 4 characters on the 64px-wide panel (scale 2 - same 16x16-per-glyph size as `hub75/2L`'s elevator digits). Both zeroes render unslashed (the font's own '0' is slashed to distinguish it from 'O' in running text; not needed here). The "1" and "3" are nudged a few pixels right of their plain-string position (the "1" more than the "3"); "00" is unshifted. |
 | `hub75/1300a` | any | Same "1300" (same size, same digit positioning) as `hub75/1300`, but inverted: black text on a grey background - the background is fixed at 25% of full white intensity, independent of the panel's global `hub75/dim`/`hub75/bright` brightness setting. |
@@ -311,8 +349,6 @@ router's client list.
 | `hub75/1300LI` | any | `hub75/1300L` inverted: the same Chilanka "1300", but black digits on a "Tan" (CSS `#D2B48C`, RGB 210/180/140) background instead of black on white; edge pixels are blended per channel and re-corrected for the CIE curve. A lit light-coloured 128x64 panel is still a heavy supply-current load - see the "Root cause history" power-supply entry. |
 | `hub75/pong` | any | Self-playing Pong, red ball. Both paddles track the ball but are speed-capped, so fast returns occasionally get past - that's what keeps score moving. Each paddle bounce also has a 30% chance of speeding the ball up by 30% (capped, and resets to normal pace at the start of each new point), so rallies don't settle into a predictable back-and-forth. Score for each side is shown as a two-digit seven-segment readout (the blocky segmented-digit style of the era's digital scoreboards, not a smooth modern font), wrapping at 100. |
 | `hub75/tictactoe` | any | Self-playing tic-tac-toe, looping forever (X red, O cyan). AI is mostly strategic (win > block > center > corner > edge, picking randomly among ties) but has a 20% chance per move of playing a fully random legal move instead, so games stay varied rather than replaying the same line every time. The winning line highlights in yellow; the board holds for ~2.7s before a new game starts, alternating which mark opens. |
-| `hub75/matrix1` `hub75/matrix2` `hub75/matrix3` | any | A grid of randomly colored squares - 4x8, 8x16, and 16x32 cells respectively (each cell an exact square given the panel's 64x32 proportions). Randomized once per trigger and held static. |
-| `hub75/matrix1c` `hub75/matrix2c` `hub75/matrix3c` | any | Same grids, but re-randomize every ~0.25s while active, looping until another topic is received. |
 | `hub75/matrix` | any | "Matrix digital rain" screensaver - 16 independent columns of small-font glyphs fall down the panel, each with its own speed and trail length; the leading glyph is bright near-white, the trail fades through green, and glyphs shimmer (re-randomize) occasionally as they fall. A column resets to a fresh random speed/length/character set once its whole trail has scrolled off the bottom. |
 | `hub75/shootingstars` | any | 3 bouncing 2x2 "stars" - star1 red, star2 blue, star3 white - each trailing a fading tail up to 6px long that always points directly back along its current direction of travel. Whenever two stars' bounding boxes coincide, a brief expanding/fading spark-burst explosion fires at the contact point. |
 | `hub75/time` | any | 2px blue border around the panel with a 2px blue horizontal center line dividing it into two boxes. Top box: west coast (Pacific) time in yellow. Bottom box: east coast (Eastern) time in green. Both 24-hour `HH:MM:SS` in a compact seven-segment font (1px-thick strokes, fixed-width digits), sized and centered so it never touches a box edge. |
@@ -342,7 +378,7 @@ router's client list.
 | `hub75/clock.utc.green` | any | Clock in UTC, green digits. |
 | `hub75/ntpset` | any | Forces an immediate NTP resync and shows a "TIME SET" confirmation for ~3s before switching to (or returning to) `hub75/clock` in whatever zone/color was last selected. The automatic sync on boot and the periodic background resync every 5 minutes (see 'HD-WF1 NTP' in menuconfig) also keep the clock accurate, but do so silently - they never take over the display, so they don't interrupt whatever else is currently showing (e.g. `hub75/ping1`). |
 
-`hub75/test1`/`test2`/`test3`/`rainbow`/`off`/`1300`/`1300a`/`1300b`/`1300c`/`1300d`/`1300e`/`1300f`/`1300L`/`1300LI`/`nn`-`nnnnnn`[`L`]/`13`/`00`/`pong`/`tictactoe`/`matrix1`/`matrix2`/`matrix3`(`c`)/`matrix`/`shootingstars`/`time`/`maze1`/`maze2`/`maze3`/`maze4`/`maze5`/`ping1`/`ping2`/solid-colors/`hub75/0`/`hub75/2`/`hub75/2L`/`hub75/2LL`/`hub75/clock`(`.*`)
+`hub75/test1`/`test2`/`test3`/`off`/`1300`/`1300a`/`1300b`/`1300c`/`1300d`/`1300e`/`1300f`/`1300L`/`1300LI`/`nn`-`nnnnnn`[`L`]/`13`/`00`/`pong`/`tictactoe`/`matrix`/`shootingstars`/`time`/`maze1`/`maze2`/`maze3`/`maze4`/`maze5`/`ping1`/`ping2`/solid-colors/`hub75/0`/`hub75/2`/`hub75/2L`/`hub75/2LL`/`hub75/clock`(`.*`)
 all replace whatever was showing (WiFi status or a previous message/pattern)
 and stay up until another message arrives on any of these topics (`hub75/0`
 specifically runs until `hub75/1`). `hub75/dim`/`bright` and

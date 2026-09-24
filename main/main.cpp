@@ -66,11 +66,16 @@ namespace {
 // Text + color currently being scrolled, updated by incoming MQTT messages
 // and read once per frame by the render loop in app_main(). Protected by
 // display_mutex since it's written from the MQTT event task and read from
-// the main task.
+// the main task. display_text defaults to CONFIG_DEFAULT_TEXT (menuconfig
+// 'HD-WF1 Default Text'); display_r/g/b/display_bg_r/g/b's hardcoded
+// defaults here are overwritten at boot from CONFIG_DEFAULT_TEXT_FG/BG (see
+// app_main()) if those parse as valid "#RRGGBB" - kept as a valid fallback
+// in case they don't.
 constexpr size_t kMaxDisplayText = 128;
 SemaphoreHandle_t display_mutex = nullptr;
-char display_text[kMaxDisplayText] = "Hello, world!";
+char display_text[kMaxDisplayText] = CONFIG_DEFAULT_TEXT;
 uint8_t display_r = 0, display_g = 255, display_b = 0;
+uint8_t display_bg_r = 0, display_bg_g = 0, display_bg_b = 0;
 bool display_dirty = true;  // set when text/color changes, so the render loop can reset scroll position
 
 // Global panel brightness, applied by the render loop regardless of which
@@ -141,27 +146,11 @@ int PANEL_WIDTH  = kPanelMaxWidth;
 int PANEL_HEIGHT = kPanelMaxHeight;
 constexpr int PANEL_CHAIN  = 1;
 
-// hub75/rainbow: one random color per panel row, generated fresh each time
-// the topic fires and held static (same style as kSolidColor) until
-// something else is displayed.
-uint8_t rainbow_row_r[kPanelMaxHeight], rainbow_row_g[kPanelMaxHeight], rainbow_row_b[kPanelMaxHeight];
-
-// hub75/matrix1/2/3(c): grids of randomly colored squares - one shared color
-// buffer sized for the largest grid (matrix3, 16 rows x 32 cols = 512
-// cells), reused across all six variants since only one is ever displayed
-// at a time. Randomized fresh on each hub75/matrix* trigger; the *c
-// (continuous) variants also re-randomize every ~1s while active - see
-// randomize_matrix()/set_matrix() and matrix_cont_tick in app_main().
-constexpr int kMatrixMaxCells = 16 * 32;
-uint8_t matrix_cell_r[kMatrixMaxCells];
-uint8_t matrix_cell_g[kMatrixMaxCells];
-uint8_t matrix_cell_b[kMatrixMaxCells];
-
 // Until the first MQTT message arrives, the panel shows live WiFi connection
 // status instead of display_text - see set_wifi_status_connecting()/
 // set_wifi_status_connected() and handle_message_payload()'s one-way
 // transition out of WifiStatus mode. kTest1/kTest2/kTest3 are diagnostic/fun
-// patterns, kSolidColor/kRainbow are simple fills, and kAutoTest (hub75/0)
+// patterns, kSolidColor is a simple fill, and kAutoTest (hub75/0)
 // cycles through all of the above in sequence forever - all triggered by
 // their respective hub75/* topics (see mqtt_event_handler) and each running
 // until another message arrives on any of these topics (kAutoTest
@@ -173,7 +162,6 @@ enum class DisplayMode {
   kTest2,
   kTest3,
   kSolidColor,
-  kRainbow,
   kAutoTest,
   kElevator,
   kElevatorLarge,
@@ -183,12 +171,6 @@ enum class DisplayMode {
   kOff,
   kPong,
   kTicTacToe,
-  kMatrix1,
-  kMatrix2,
-  kMatrix3,
-  kMatrix1Cont,
-  kMatrix2Cont,
-  kMatrix3Cont,
   kShootingStars,
   kTimeFrame,
   kMaze1,
@@ -221,13 +203,14 @@ DisplayMode display_mode = DisplayMode::kWifiStatus;
 // whatever else is currently on screen (e.g. hub75/ping1).
 constexpr int kClockConfirmTicks = 100;  // 100 * 30ms = 3.0s
 
-constexpr int kMaxStatusLines = 3;
+constexpr int kMaxStatusLines = 4;
 constexpr size_t kMaxStatusLineLen = 32;
-// Row Y for each status line - static, horizontally and vertically
-// centered, never scrolled, so no per-line scroll-position state is needed.
-// 11px pitch between rows (5px glyph + 6px gap) with the whole 3-row block
-// (27px tall) centered in the confirmed 32px-tall panel.
-constexpr int16_t kStatusRowY[kMaxStatusLines] = {2, 13, 24};
+// Row Y is computed per-frame in the render loop, not a fixed array here -
+// horizontally and vertically centered (never scrolled, so no per-line
+// scroll-position state is needed) against the *live* PANEL_HEIGHT, since a
+// fixed table tuned for one panel profile would sit off-center on the
+// other, and the actual line count varies by WiFi state (2 for "No WiFi
+// configured", 3 while connecting, 4 once connected).
 
 struct StatusLine {
   char text[kMaxStatusLineLen] = "";
@@ -422,6 +405,7 @@ double ping_once_ms(const char *host_ip, uint32_t timeout_ms) {
 // the given port; a refused (closed-port) or unanswered connection both
 // count as `timeout_ms`, same as an ICMP timeout - so aim it at a port
 // that's actually open on the target for a meaningful reading.
+#if CONFIG_PING_METHOD_TCP
 double tcp_ping_once_ms(const char *host_ip, uint16_t port, uint32_t timeout_ms) {
   const int64_t start_us = esp_timer_get_time();
   const double timeout_val = static_cast<double>(timeout_ms);
@@ -468,6 +452,7 @@ double tcp_ping_once_ms(const char *host_ip, uint16_t port, uint32_t timeout_ms)
   close(sock);
   return rtt_ms;
 }
+#endif  // CONFIG_PING_METHOD_TCP
 
 // Parses CONFIG_PING_TARGETS (see 'HD-WF1 Ping' in menuconfig) - a
 // comma-separated list of up to kMaxPingTargets "host" or "host:port"
@@ -569,7 +554,11 @@ double ping_target_once_ms(uint32_t timeout_ms) {
 // matching the ESP32-friendly "background task updates shared state under
 // the mutex, render loop just reads it" pattern used for WiFi status
 // elsewhere in this file.
-void ping1_task(void *arg) {
+// [[maybe_unused]]: only called via xTaskCreate() below, which is
+// itself gated on HUB75_FULL_EFFECTS - this stays compiled either way
+// (see "Lean build: HUB75_FULL_EFFECTS" in CLAUDE.md) so toggling that
+// flag needs no further #if plumbing here.
+[[maybe_unused]] void ping1_task(void *arg) {
   (void)arg;
   constexpr uint32_t kPingTimeoutMs = 500;   // generous enough for a real reply, still bounded
   constexpr uint32_t kPingIntervalMs = 250;  // minimum gap between samples - paces the scroll
@@ -608,7 +597,7 @@ void ping1_task(void *arg) {
 // up - color and flight speed are bucketed into the same four latency
 // bands as hub75/ping1 (plus a distinct "timed out" band) so the two
 // effects read as one consistent language, just very differently staged.
-void ping2_task(void *arg) {
+[[maybe_unused]] void ping2_task(void *arg) {  // see ping1_task()'s comment above
   (void)arg;
   constexpr uint32_t kPingTimeoutMs = 500;
   constexpr uint32_t kPingIntervalMs = 150;
@@ -676,7 +665,7 @@ void ping2_task(void *arg) {
 // breadcrumbs are colored, so one task/one color state covers both).
 // run_maze_frame() reads whatever's latest once per solver step and stamps
 // it as a breadcrumb - the maze's own movement never waits on this.
-void maze4_task(void *arg) {
+[[maybe_unused]] void maze4_task(void *arg) {  // see ping1_task()'s comment above
   (void)arg;
   constexpr uint32_t kPingTimeoutMs = 500;
   constexpr uint32_t kPingIntervalMs = 200;
@@ -804,23 +793,23 @@ void set_wifi_status_connected(const esp_ip4_addr_t &ip) {
     status_lines[1].r = 255;
     status_lines[1].g = 255;
     status_lines[1].b = 0;
-    // Reflects CONFIG_MQTT_TOPIC_MAC_PREFIX directly (device_id_hex is ready
-    // long before this fires - see compute_device_id() in app_main()) rather
-    // than reading mqtt_topic_ns, which mqtt_init() doesn't populate until
-    // after WiFi connects and would still read the pre-MAC-prefix default
-    // the first time this runs. NOTE: at 4px/char (kSmallFontAdvance) this
-    // line is 26 chars/104px - fits the 128-wide panel with room to spare,
-    // but overflows the 64-wide profile (already a tight fit even before
-    // this feature, at 13 chars/52px for "Topic: hub75/" alone).
-#if CONFIG_MQTT_TOPIC_MAC_PREFIX
-    snprintf(status_lines[2].text, kMaxStatusLineLen, "Topic: hub75/%s/", device_id_hex);
-#else
+    // Split across two lines (topic prefix, then the MAC on its own) rather
+    // than one combined "Topic: hub75/<mac>/" line - device_id_hex is shown
+    // unconditionally here (unlike the topic string itself, which only
+    // embeds it when CONFIG_MQTT_TOPIC_MAC_PREFIX is on - see
+    // mqtt_build_wire_topic()) since it's also this device's REST API path
+    // prefix and generally useful for network discovery regardless of that
+    // setting. device_id_hex is ready long before this fires - see
+    // compute_device_id() in app_main().
     strlcpy(status_lines[2].text, "Topic: hub75/", kMaxStatusLineLen);
-#endif
     status_lines[2].r = 255;
     status_lines[2].g = 255;
     status_lines[2].b = 255;
-    status_line_count = 3;
+    strlcpy(status_lines[3].text, device_id_hex, kMaxStatusLineLen);
+    status_lines[3].r = 255;
+    status_lines[3].g = 255;
+    status_lines[3].b = 255;
+    status_line_count = 4;
   }
   xSemaphoreGive(display_mutex);
 }
@@ -836,6 +825,29 @@ esp_timer_handle_t wifi_retry_timer = nullptr;
 
 void wifi_retry_timer_cb(void *arg) {
   esp_wifi_connect();
+}
+
+// Boot fallback: if the WiFi status screen is still showing 15s after
+// connecting (no real hub75/1300L, hub75/message, etc. has arrived to move
+// display_mode past kWifiStatus - see set_wifi_status_connected()'s comment
+// above and set_number_l()'s one-way transition), show this in place of
+// waiting on the network indefinitely. Same one-shot esp_timer pattern as
+// wifi_retry_timer above, for the same reason (no extra task/stack).
+// set_number_l() is defined later in the file (it's the hub75/nn..nnnnnn[L]
+// handler) - forward-declared here since this callback needs to call it but
+// runs long before that point in the source.
+void set_number_l(const char *data, int data_len, const char *digits);
+
+constexpr int kConnectedScreenFallbackMs = 15000;
+esp_timer_handle_t connected_screen_timer = nullptr;
+
+void connected_screen_timer_cb(void *arg) {
+  xSemaphoreTake(display_mutex, portMAX_DELAY);
+  const bool still_on_wifi_status = (display_mode == DisplayMode::kWifiStatus);
+  xSemaphoreGive(display_mutex);
+  if (!still_on_wifi_status) return;
+  constexpr const char *kFallbackPayload = "{\"fg\":\"#df6f3f\",\"bg\":\"#000000\",\"hue\":\"#555555\"}";
+  set_number_l(kFallbackPayload, static_cast<int>(strlen(kFallbackPayload)), "1300");
 }
 
 void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
@@ -860,6 +872,10 @@ void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id
     set_wifi_status_connected(event->ip_info.ip);
     wifi_link_up = true;
     xEventGroupSetBits(wifi_event_group, kWifiConnectedBit);
+    if (esp_timer_is_active(connected_screen_timer)) {
+      esp_timer_stop(connected_screen_timer);
+    }
+    esp_timer_start_once(connected_screen_timer, static_cast<uint64_t>(kConnectedScreenFallbackMs) * 1000);
   }
 }
 
@@ -890,6 +906,11 @@ void wifi_init(void) {
   retry_timer_args.callback = &wifi_retry_timer_cb;
   retry_timer_args.name = "wifi_retry";
   ESP_ERROR_CHECK(esp_timer_create(&retry_timer_args, &wifi_retry_timer));
+
+  esp_timer_create_args_t connected_screen_timer_args = {};
+  connected_screen_timer_args.callback = &connected_screen_timer_cb;
+  connected_screen_timer_args.name = "connected_fallback";
+  ESP_ERROR_CHECK(esp_timer_create(&connected_screen_timer_args, &connected_screen_timer));
 
   ESP_ERROR_CHECK(esp_netif_init());
   ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -998,19 +1019,6 @@ constexpr const char *kPongTopic = "hub75/pong";
 // varied rather than replaying the same optimal line every time.
 constexpr const char *kTicTacToeTopic = "hub75/tictactoe";
 
-// hub75/matrix1/2/3: a grid of randomly colored squares, sized so each cell
-// is an actual square given the panel's 64x32 (2:1) proportions - 4 rows x
-// 8 cols, 8 rows x 16 cols, 16 rows x 32 cols respectively. Randomized once
-// per trigger and held static. The *c variants are the same grids but
-// re-randomize every ~1s while active, until another topic changes the
-// mode - see set_matrix()/randomize_matrix()/draw_matrix().
-constexpr const char *kMatrix1Topic = "hub75/matrix1";
-constexpr const char *kMatrix2Topic = "hub75/matrix2";
-constexpr const char *kMatrix3Topic = "hub75/matrix3";
-constexpr const char *kMatrix1ContTopic = "hub75/matrix1c";
-constexpr const char *kMatrix2ContTopic = "hub75/matrix2c";
-constexpr const char *kMatrix3ContTopic = "hub75/matrix3c";
-
 // hub75/matrix: "Matrix digital rain" screensaver - columns of falling,
 // randomly-shimmering small-font glyphs with a bright head and a fading
 // green tail - see run_matrix_rain_frame().
@@ -1064,8 +1072,6 @@ constexpr const char *kPing2Topic = "hub75/ping2";
 constexpr const char *kFlashTopic = "hub75/flash";
 constexpr const char *kNoFlashTopic = "hub75/noflash";
 
-// One random color per row - see rainbow_row_r/g/b.
-constexpr const char *kRainbowTopic = "hub75/rainbow";
 
 // hub75/off: blanks the panel (DisplayMode::kOff draws nothing - the render
 // loop already clears the screen every frame before the mode switch).
@@ -1269,30 +1275,6 @@ void random_color(uint8_t *r, uint8_t *g, uint8_t *b, uint8_t base = 0, uint16_t
   *b = static_cast<uint8_t>(base + esp_random() % range);
 }
 
-void set_rainbow() {
-  xSemaphoreTake(display_mutex, portMAX_DELAY);
-  for (int row = 0; row < PANEL_HEIGHT; row++) {
-    random_color(&rainbow_row_r[row], &rainbow_row_g[row], &rainbow_row_b[row]);
-  }
-  display_mode = DisplayMode::kRainbow;
-  xSemaphoreGive(display_mutex);
-  ESP_LOGI(MQTT_TAG, "rainbow");
-}
-
-void randomize_matrix(int cell_count) {
-  for (int i = 0; i < cell_count; i++) {
-    random_color(&matrix_cell_r[i], &matrix_cell_g[i], &matrix_cell_b[i]);
-  }
-}
-
-void set_matrix(DisplayMode mode, int cell_count, const char *name) {
-  xSemaphoreTake(display_mutex, portMAX_DELAY);
-  randomize_matrix(cell_count);
-  display_mode = mode;
-  xSemaphoreGive(display_mutex);
-  ESP_LOGI(MQTT_TAG, "switched to %s", name);
-}
-
 // Executes one command (an MQTT topic + payload). Shared by the MQTT event
 // handler and the REST API (http_api_init) so both control paths behave
 // identically. Returns false if `topic` is not a known/live command. Topics
@@ -1341,30 +1323,6 @@ bool dispatch_command(const char *topic, int topic_len, const char *data, int da
     set_test_mode(DisplayMode::kTicTacToe, "tic-tac-toe (hub75/tictactoe)");
 #endif
 #if HUB75_FULL_EFFECTS
-  } else if (topic_matches(topic, topic_len, kMatrix1Topic)) {
-    set_matrix(DisplayMode::kMatrix1, 4 * 8, "matrix1 (hub75/matrix1)");
-#endif
-#if HUB75_FULL_EFFECTS
-  } else if (topic_matches(topic, topic_len, kMatrix2Topic)) {
-    set_matrix(DisplayMode::kMatrix2, 8 * 16, "matrix2 (hub75/matrix2)");
-#endif
-#if HUB75_FULL_EFFECTS
-  } else if (topic_matches(topic, topic_len, kMatrix3Topic)) {
-    set_matrix(DisplayMode::kMatrix3, 16 * 32, "matrix3 (hub75/matrix3)");
-#endif
-#if HUB75_FULL_EFFECTS
-  } else if (topic_matches(topic, topic_len, kMatrix1ContTopic)) {
-    set_matrix(DisplayMode::kMatrix1Cont, 4 * 8, "matrix1 continuous (hub75/matrix1c)");
-#endif
-#if HUB75_FULL_EFFECTS
-  } else if (topic_matches(topic, topic_len, kMatrix2ContTopic)) {
-    set_matrix(DisplayMode::kMatrix2Cont, 8 * 16, "matrix2 continuous (hub75/matrix2c)");
-#endif
-#if HUB75_FULL_EFFECTS
-  } else if (topic_matches(topic, topic_len, kMatrix3ContTopic)) {
-    set_matrix(DisplayMode::kMatrix3Cont, 16 * 32, "matrix3 continuous (hub75/matrix3c)");
-#endif
-#if HUB75_FULL_EFFECTS
   } else if (topic_matches(topic, topic_len, kMatrixRainTopic)) {
     set_test_mode(DisplayMode::kMatrixRain, "matrix digital rain (hub75/matrix)");
 #endif
@@ -1408,10 +1366,6 @@ bool dispatch_command(const char *topic, int topic_len, const char *data, int da
     toggle_blink();
   } else if (topic_matches(topic, topic_len, kNoFlashTopic)) {
     stop_blink();
-#if HUB75_FULL_EFFECTS
-  } else if (topic_matches(topic, topic_len, kRainbowTopic)) {
-    set_rainbow();
-#endif
   } else if (topic_matches(topic, topic_len, kOffTopic)) {
     set_test_mode(DisplayMode::kOff, "off (hub75/off)");
   } else if (topic_matches(topic, topic_len, kFixed1300Topic)) {
@@ -1493,6 +1447,15 @@ bool dispatch_command(const char *topic, int topic_len, const char *data, int da
 char mqtt_topic_ns[24] = "hub75/";
 char mqtt_wire_status_topic[96];
 char mqtt_wire_message_topic[96];
+
+// "<CONFIG_MQTT_CLIENT_ID>-<device_id_hex>" - unlike mqtt_topic_ns above,
+// this is unconditional (not gated on CONFIG_MQTT_TOPIC_MAC_PREFIX): MQTT
+// requires unique client IDs per broker, so flashing the same build to two
+// boards with an unqualified client ID would make the second board's
+// connect silently kick the first one off (most brokers, mosquitto
+// included, disconnect the older session on a duplicate client ID) rather
+// than erroring loudly. Built once by mqtt_init(), same as the topics above.
+char mqtt_client_id[64];
 
 // Rewrites a canonical "hub75/..." topic into its actual wire-level form
 // under mqtt_topic_ns; a topic not starting with "hub75/" (a fully custom
@@ -1583,12 +1546,13 @@ void mqtt_init(void) {
 #endif
   mqtt_build_wire_topic(CONFIG_MQTT_STATUS_TOPIC, mqtt_wire_status_topic, sizeof(mqtt_wire_status_topic));
   mqtt_build_wire_topic(CONFIG_MQTT_MESSAGE_TOPIC, mqtt_wire_message_topic, sizeof(mqtt_wire_message_topic));
-  ESP_LOGI(MQTT_TAG, "topic namespace '%s' (status: %s, message: %s)", mqtt_topic_ns, mqtt_wire_status_topic,
-           mqtt_wire_message_topic);
+  snprintf(mqtt_client_id, sizeof(mqtt_client_id), "%s-%s", CONFIG_MQTT_CLIENT_ID, device_id_hex);
+  ESP_LOGI(MQTT_TAG, "topic namespace '%s' (status: %s, message: %s), client ID '%s'", mqtt_topic_ns,
+           mqtt_wire_status_topic, mqtt_wire_message_topic, mqtt_client_id);
 
   esp_mqtt_client_config_t mqtt_cfg = {};
   mqtt_cfg.broker.address.uri = CONFIG_MQTT_BROKER_URI;
-  mqtt_cfg.credentials.client_id = CONFIG_MQTT_CLIENT_ID;
+  mqtt_cfg.credentials.client_id = mqtt_client_id;
   if (strlen(CONFIG_MQTT_USERNAME) > 0) {
     mqtt_cfg.credentials.username = CONFIG_MQTT_USERNAME;
   }
@@ -2493,20 +2457,6 @@ void draw_rainbow(const uint8_t *r, const uint8_t *g, const uint8_t *b) {
   }
 }
 
-// hub75/matrix1/2/3(c): rows x cols grid of randomly colored squares, sized
-// to exactly divide the panel (see matrix_cell_r/g/b above).
-void draw_matrix(int rows, int cols) {
-  const int16_t cell_w = static_cast<int16_t>(PANEL_WIDTH / cols);
-  const int16_t cell_h = static_cast<int16_t>(PANEL_HEIGHT / rows);
-  for (int r = 0; r < rows; r++) {
-    for (int c = 0; c < cols; c++) {
-      const int idx = r * cols + c;
-      dma_display->fillRect(static_cast<int16_t>(c * cell_w), static_cast<int16_t>(r * cell_h), cell_w, cell_h,
-                             matrix_cell_r[idx], matrix_cell_g[idx], matrix_cell_b[idx]);
-    }
-  }
-}
-
 // hub75/time: 2px blue border around the whole panel plus a 2px blue
 // horizontal line through the vertical center.
 void draw_time_frame() {
@@ -2654,6 +2604,19 @@ extern "C" void app_main(void)
     ESP_LOGI(TAG, "boot, reset reason=%d", esp_reset_reason());
 
     display_mutex = xSemaphoreCreateMutex();
+
+    // CONFIG_DEFAULT_TEXT_FG/BG (menuconfig 'HD-WF1 Default Text') override
+    // display_r/g/b/display_bg_r/g/b's hardcoded fallback defaults, if they
+    // parse - nothing else has touched these globals yet at this point.
+    if (strlen(CONFIG_DEFAULT_TEXT_FG) > 0 &&
+        !parse_hex_color(CONFIG_DEFAULT_TEXT_FG, &display_r, &display_g, &display_b)) {
+        ESP_LOGW(TAG, "CONFIG_DEFAULT_TEXT_FG '%s' is not a valid #RRGGBB, using default", CONFIG_DEFAULT_TEXT_FG);
+    }
+    if (strlen(CONFIG_DEFAULT_TEXT_BG) > 0 &&
+        !parse_hex_color(CONFIG_DEFAULT_TEXT_BG, &display_bg_r, &display_bg_g, &display_bg_b)) {
+        ESP_LOGW(TAG, "CONFIG_DEFAULT_TEXT_BG '%s' is not a valid #RRGGBB, using default", CONFIG_DEFAULT_TEXT_BG);
+    }
+
     parse_ping_targets();  // hub75/ping1 and hub75/ping2's target list - see CONFIG_PING_TARGETS
     compute_device_id();  // needed by mqtt_init()/http_api_init() below for MAC-prefixed topics/paths
     ESP_LOGI(TAG, "device ID: %s", device_id_hex);
@@ -2722,10 +2685,14 @@ extern "C" void app_main(void)
     // Until the first MQTT message arrives, this shows live WiFi status
     // instead (see set_wifi_status_connecting()/set_wifi_status_connected()
     // and display_mode). Scrolled text/color is updated live from
-    // CONFIG_MQTT_MESSAGE_TOPIC - display_text/r/g/b start out as
-    // "Hello, world!" in green as the eventual fallback.
+    // CONFIG_MQTT_MESSAGE_TOPIC - display_text/r/g/b/display_bg_r/g/b start
+    // out at their CONFIG_DEFAULT_TEXT/FG/BG menuconfig values (see
+    // app_main()), so kMessage (reachable via set_test_mode() e.g.
+    // auto-test stopping, in addition to the boot default) shows that
+    // rather than placeholder text before any real message has arrived.
     char local_text[kMaxDisplayText];
     uint8_t local_r, local_g, local_b;
+    uint8_t local_bg_r = 0, local_bg_g = 0, local_bg_b = 0;
     int16_t text_px = 0;
     const int16_t message_y = (PANEL_HEIGHT - 8) / 2;
     int16_t x = PANEL_WIDTH;
@@ -3011,12 +2978,6 @@ extern "C" void app_main(void)
     // separate debounce is needed beyond that cadence.
     constexpr int kButtonLongPressTicks = 33;  // ~1s
     int button_hold_ticks = 0;
-
-    // hub75/matrix1c/2c/3c: re-randomize every ~0.25s while any of the three
-    // continuous variants is active - see the kMatrix*Cont render-loop
-    // cases below.
-    constexpr int kMatrixContTicks = 8;  // ~0.25s
-    int matrix_cont_tick = 0;
 
     // hub75/matrix: "Matrix digital rain" screensaver - columns of falling,
     // randomly-shimmering small-font glyphs (see draw_text_small()/
@@ -3548,8 +3509,12 @@ extern "C" void app_main(void)
     // arrays and app_main()'s single giant stack frame has already needed a
     // larger stack size once before (see CONFIG_ESP_MAIN_TASK_STACK_SIZE in
     // sdkconfig.defaults) after similar maze state was added.
-    bool maze_breadcrumbs = false;  // true only while hub75/maze4 or hub75/maze5 is the active mode
-    uint8_t maze_current_latency_r = 0, maze_current_latency_g = 255, maze_current_latency_b = 0;
+    // [[maybe_unused]]: every read of these is itself gated on
+    // HUB75_FULL_EFFECTS (kMaze4/kMaze5 are only reachable that way - see
+    // ping1_task()'s comment above), so they're write-only in the lean
+    // build despite staying compiled either way.
+    [[maybe_unused]] bool maze_breadcrumbs = false;  // true only while hub75/maze4 or hub75/maze5 is the active mode
+    [[maybe_unused]] uint8_t maze_current_latency_r = 0, maze_current_latency_g = 255, maze_current_latency_b = 0;
 #if HUB75_FULL_EFFECTS
     static bool maze_trail_set[kMazeMaxCols][kMazeMaxRows];
     static uint8_t maze_trail_r[kMazeMaxCols][kMazeMaxRows];
@@ -4104,6 +4069,19 @@ extern "C" void app_main(void)
     DisplayMode prev_frame_mode = DisplayMode::kWifiStatus;
 
 
+    // Reset-reason banner: "RR=<n>" briefly, before the owner-info splash
+    // below, so a crash loop is visible on the panel itself without pulling
+    // the applog (n is esp_reset_reason() - notably 4 = ESP_RST_PANIC).
+    // Non-blocking, like everything else in this loop - unlike an earlier
+    // version of this (see git history/comment near WF1_BUTTON_PIN in
+    // app_main() above), this doesn't delay wifi_init()/network_init_task(),
+    // it's purely a render-loop overlay running concurrently with them.
+    constexpr int64_t kRrBannerMs = 2000;
+    char rr_banner_text[16];
+    snprintf(rr_banner_text, sizeof(rr_banner_text), "RR=%d", static_cast<int>(esp_reset_reason()));
+    const int64_t rr_banner_end_us = esp_timer_get_time() + kRrBannerMs * 1000;
+    bool rr_banner_drawn = false;
+
     // Boot splash: up to 4 lines of text from CONFIG_SPLASH_LINE1..4 (menuconfig
     // "HD-WF1 Boot Splash"; the real values live in the gitignored sdkconfig),
     // yellow on black in the 1px-stroke small font, shown for kSplashMs from
@@ -4174,10 +4152,6 @@ extern "C" void app_main(void)
             ttt_move_tick = 0;
             ttt_result_tick = 0;
         }
-        if (mode != DisplayMode::kMatrix1Cont && mode != DisplayMode::kMatrix2Cont &&
-            mode != DisplayMode::kMatrix3Cont) {
-            matrix_cont_tick = 0;
-        }
         if (mode != DisplayMode::kMatrixRain) {
             for (int c = 0; c < PANEL_WIDTH / kSmallFontAdvance; c++) reset_matrix_rain_column(c, true);
         }
@@ -4246,15 +4220,14 @@ extern "C" void app_main(void)
         memcpy(local_number_fg, number_l_fg, 3);
         memcpy(local_number_bg, number_l_bg, 3);
         memcpy(local_number_hue, number_l_hue, 3);
-        uint8_t local_rainbow_r[kPanelMaxHeight], local_rainbow_g[kPanelMaxHeight], local_rainbow_b[kPanelMaxHeight];
-        memcpy(local_rainbow_r, rainbow_row_r, sizeof(local_rainbow_r));
-        memcpy(local_rainbow_g, rainbow_row_g, sizeof(local_rainbow_g));
-        memcpy(local_rainbow_b, rainbow_row_b, sizeof(local_rainbow_b));
         if (mode == DisplayMode::kMessage) {
             strlcpy(local_text, display_text, kMaxDisplayText);
             local_r = display_r;
             local_g = display_g;
             local_b = display_b;
+            local_bg_r = display_bg_r;
+            local_bg_g = display_bg_g;
+            local_bg_b = display_bg_b;
         } else if (mode == DisplayMode::kWifiStatus) {
             local_status_count = status_line_count;
             for (int i = 0; i < local_status_count; i++) {
@@ -4294,6 +4267,18 @@ extern "C" void app_main(void)
             dma_display->setBrightness8(applied_brightness);
         }
 
+        if (esp_timer_get_time() < rr_banner_end_us) {
+            if (!rr_banner_drawn) {
+                rr_banner_drawn = true;
+                dma_display->clearScreen();
+                draw_text_small(static_cast<int16_t>((PANEL_WIDTH - small_text_width(rr_banner_text)) / 2),
+                                 static_cast<int16_t>((PANEL_HEIGHT - kSmallFontHeight) / 2), rr_banner_text, 255,
+                                 255, 255);
+            }
+            vTaskDelay(pdMS_TO_TICKS(30));
+            continue;
+        }
+
         if (!splash_over) {
             if (esp_timer_get_time() < splash_end_us) {
                 const int want = wifi_link_up ? 1 : 0;
@@ -4326,7 +4311,8 @@ extern "C" void app_main(void)
                                       mode == DisplayMode::kFixed1300D || mode == DisplayMode::kFixed1300E ||
                                       mode == DisplayMode::kFixed1300F || mode == DisplayMode::kNumberL ||
                                       mode == DisplayMode::kFixed1300LI ||
-                                      mode == DisplayMode::kFixed13 || mode == DisplayMode::kFixed00);
+                                      mode == DisplayMode::kFixed13 || mode == DisplayMode::kFixed00 ||
+                                      mode == DisplayMode::kWifiStatus);
             if (static_mode) {
                 uint32_t key = (static_cast<uint32_t>(mode) + 1u) * 2654435761u;
                 key ^= (static_cast<uint32_t>(local_solid_r) << 16) | (static_cast<uint32_t>(local_solid_g) << 8) |
@@ -4338,6 +4324,15 @@ extern "C" void app_main(void)
                         key = key * 16777619u ^ (static_cast<uint32_t>(local_number_fg[i]) << 16 |
                                                  static_cast<uint32_t>(local_number_bg[i]) << 8 |
                                                  static_cast<uint32_t>(local_number_hue[i]));
+                }
+                if (mode == DisplayMode::kWifiStatus) {  // text + colour of each line - changes on every WiFi state transition
+                    key = key * 16777619u ^ static_cast<uint32_t>(local_status_count);
+                    for (int i = 0; i < local_status_count; i++) {
+                        for (const char *c = local_status[i].text; *c; c++) key = key * 16777619u ^ static_cast<uint8_t>(*c);
+                        key = key * 16777619u ^ (static_cast<uint32_t>(local_status[i].r) << 16 |
+                                                 static_cast<uint32_t>(local_status[i].g) << 8 |
+                                                 static_cast<uint32_t>(local_status[i].b));
+                    }
                 }
                 if (key == last_static_key) {
                     // Still mirror the gateway-ping overlay (see near
@@ -4365,7 +4360,15 @@ extern "C" void app_main(void)
         const bool skip_clear = !wanted_blink && !mode_changed &&
                                 (mode == DisplayMode::kMaze1 || mode == DisplayMode::kMaze2 ||
                                  mode == DisplayMode::kMaze3);
-        if (!skip_clear) dma_display->clearScreen();
+        if (!skip_clear) {
+            // kMessage clears to its configurable background (CONFIG_DEFAULT_TEXT_BG,
+            // 'HD-WF1 Default Text') instead of the fixed black every other mode uses.
+            if (mode == DisplayMode::kMessage) {
+                dma_display->fillScreenRGB888(local_bg_r, local_bg_g, local_bg_b);
+            } else {
+                dma_display->clearScreen();
+            }
+        }
 
         bool blink_visible = true;
         if (wanted_blink) {
@@ -4384,6 +4387,14 @@ extern "C" void app_main(void)
 
         if (blink_visible) switch (mode) {
             case DisplayMode::kMessage:
+                // Font is a menuconfig choice ('HD-WF1 Default Text' ->
+                // 'Default text font'), not a runtime setting - it applies to
+                // every kMessage text, not just the boot default.
+#if CONFIG_DEFAULT_TEXT_FONT_SMALL
+                draw_text_small(static_cast<int16_t>((PANEL_WIDTH - small_text_width(local_text)) / 2),
+                                 static_cast<int16_t>((PANEL_HEIGHT - kSmallFontHeight) / 2), local_text, local_r,
+                                 local_g, local_b);
+#else
                 if (reset_scroll) {
                     text_px = static_cast<int16_t>(strlen(local_text) * kFontAdvance);
                     x = PANEL_WIDTH;
@@ -4392,19 +4403,28 @@ extern "C" void app_main(void)
                 if (--x < -text_px) {
                     x = PANEL_WIDTH;
                 }
+#endif
                 break;
 
-            case DisplayMode::kWifiStatus:
-                // Small font, centered, static - the longest line here (an
-                // IPv4 address) fits inside the panel width, so there's
-                // nothing to scroll.
+            case DisplayMode::kWifiStatus: {
+                // Small font, centered both ways, static - the longest line
+                // here (an IPv4 address) fits inside the panel width, so
+                // there's nothing to scroll. Row Y is computed against the
+                // *live* PANEL_HEIGHT and the actual line count (which
+                // varies by WiFi state), not a fixed table, so this stays
+                // vertically centered on both panel profiles - same 9px
+                // pitch (5px glyph + 4px gap) as the boot splash block.
+                constexpr int16_t kRowPitch = 9;
+                const int16_t block_h = static_cast<int16_t>(local_status_count * kRowPitch - 4);
+                const int16_t row_y0 = static_cast<int16_t>((PANEL_HEIGHT - block_h) / 2);
                 for (int i = 0; i < local_status_count; i++) {
                     const int16_t line_x =
                         static_cast<int16_t>((PANEL_WIDTH - small_text_width(local_status[i].text)) / 2);
-                    draw_text_small(line_x, kStatusRowY[i], local_status[i].text, local_status[i].r,
-                                     local_status[i].g, local_status[i].b);
+                    draw_text_small(line_x, static_cast<int16_t>(row_y0 + i * kRowPitch), local_status[i].text,
+                                     local_status[i].r, local_status[i].g, local_status[i].b);
                 }
                 break;
+            }
 
             case DisplayMode::kTest1:
                 run_test1_frame();
@@ -4420,10 +4440,6 @@ extern "C" void app_main(void)
 
             case DisplayMode::kSolidColor:
                 dma_display->fillScreenRGB888(local_solid_r, local_solid_g, local_solid_b);
-                break;
-
-            case DisplayMode::kRainbow:
-                draw_rainbow(local_rainbow_r, local_rainbow_g, local_rainbow_b);
                 break;
 
             case DisplayMode::kOff:
@@ -4547,48 +4563,6 @@ extern "C" void app_main(void)
 
             case DisplayMode::kTicTacToe:
                 run_tictactoe_frame();
-                break;
-
-            case DisplayMode::kMatrix1:
-                draw_matrix(4, 8);
-                break;
-
-            case DisplayMode::kMatrix2:
-                draw_matrix(8, 16);
-                break;
-
-            case DisplayMode::kMatrix3:
-                draw_matrix(16, 32);
-                break;
-
-            case DisplayMode::kMatrix1Cont:
-                if (++matrix_cont_tick >= kMatrixContTicks) {
-                    matrix_cont_tick = 0;
-                    xSemaphoreTake(display_mutex, portMAX_DELAY);
-                    randomize_matrix(4 * 8);
-                    xSemaphoreGive(display_mutex);
-                }
-                draw_matrix(4, 8);
-                break;
-
-            case DisplayMode::kMatrix2Cont:
-                if (++matrix_cont_tick >= kMatrixContTicks) {
-                    matrix_cont_tick = 0;
-                    xSemaphoreTake(display_mutex, portMAX_DELAY);
-                    randomize_matrix(8 * 16);
-                    xSemaphoreGive(display_mutex);
-                }
-                draw_matrix(8, 16);
-                break;
-
-            case DisplayMode::kMatrix3Cont:
-                if (++matrix_cont_tick >= kMatrixContTicks) {
-                    matrix_cont_tick = 0;
-                    xSemaphoreTake(display_mutex, portMAX_DELAY);
-                    randomize_matrix(16 * 32);
-                    xSemaphoreGive(display_mutex);
-                }
-                draw_matrix(16, 32);
                 break;
 
             case DisplayMode::kMatrixRain:

@@ -101,9 +101,12 @@ used, not the maximum.
 
 **Render loop draw conventions** (single-buffered, so anything drawn is
 immediately scanned out):
-- Static screens (solid colours, `hub75/1300*`, `off`) are drawn once and
-  skipped until their content changes (`last_static_key` in the loop). Add new
-  static modes to that `static_mode` list.
+- Static screens (solid colours, `hub75/1300*`, `off`, the boot/WiFi-status
+  screens) are drawn once and skipped until their content changes
+  (`last_static_key` in the loop). Add new static modes to that `static_mode`
+  list - a mode left out of it clears+redraws every ~30ms tick even when
+  nothing changed, which flickers visibly on this single-buffered display
+  (`kWifiStatus` shipped without this for a while before being added).
 - `maze1`-`3` skip the per-frame `clearScreen()`, overdraw identical wall
   pixels, and erase only the previous dot pixels (`maze_dot_prev_*`); a new
   maze (`generate_maze()`) or mode change does one full clear. Other animated
@@ -226,8 +229,8 @@ once by `init_display()` at boot from whichever `PanelProfile`
 (`kProfile128x64`/`kProfile64x32`, near the `WF1_*_PIN` defines) menuconfig
 selected. `kPanelMaxWidth`/`kPanelMaxHeight` (128/64) are the true
 compile-time constants; anything that needs a fixed-size array sized by
-panel dimensions (maze buffers, the ping1 graph, matrix rain columns,
-rainbow rows) is sized off those maxes and clamped to the *live* dimensions
+panel dimensions (maze buffers, the ping1 graph, matrix rain columns) is
+sized off those maxes and clamped to the *live* dimensions
 at runtime, not off `PANEL_WIDTH`/`PANEL_HEIGHT` directly — follow that
 pattern (already used by the maze solver before this feature existed) for
 any new panel-size-dependent fixed buffer.
@@ -281,6 +284,24 @@ are trimmed in `sdkconfig.defaults`. Known failure modes, all seen for real:
   in `esp_usb_console_interrupt`, USB enumeration errors `-71`/`-110`. Root
   cause unidentified (stable at 64×32 and at 128×64 2-bit; crashes at 4/6/8-bit);
   console is UART now. Don't switch it back without re-testing.
+
+**Flash and static RAM are worth tracking too, separately from heap.** `idf.py
+size` on a build with WiFi+MQTT+HTTP API all configured (this project's
+normal state once menuconfig has real credentials, not the credential-free
+default) reports the app binary at ~935 KB against the 1M `factory` app
+partition - ~89% full, ~110 KB free - and static DIRAM (`.text`+`.bss`+
+`.data`+`.vectors`, i.e. before any heap allocation happens) at ~129 KB/172 KB
+- 75%, ~42 KB free. Re-run `idf.py size` after adding a feature that pulls in
+a new component, rather than assuming the heap-budget numbers above are the
+only limit. The physical flash chip is 4 MB, but `partitions.csv` only
+allocates ~1.15 MB of it (`nvs`+`phy_init`+`factory`+`coredump`+`applog`), so
+there's ample raw chip space to grow the `factory` partition or add OTA
+`ota_0`/`ota_1`/`otadata` slots later - the 89%-full figure is about the
+*current* partition size, not a hard chip-capacity ceiling. There is
+currently no OTA support at all (`esp_ota_ops`/`esp_https_ota` are unused,
+`partitions.csv` has a single `factory` app slot); every firmware update goes
+through the physical bridge-pads/flash/unbridge procedure in "Build / flash /
+monitor" above (full detail in `README.md`'s "Flashing" section).
 
 **Reading logs from a board you can't attach to:** every `ESP_LOG` line is also
 appended to the 64K `applog` partition (0x120000) by a hook in `main.cpp`,

@@ -118,6 +118,15 @@ menu "HD-WF1 MQTT"
     config MQTT_CLIENT_ID
         string "MQTT client ID"
         default "hd-wf1-hub75"
+        help
+            This device's WiFi MAC (12 lowercase hex digits) is always
+            appended as "-<mac>" at runtime, so the same build can be
+            flashed onto multiple boards sharing one broker without their
+            client IDs colliding (MQTT requires unique client IDs per
+            broker - a collision makes the second board's connect silently
+            disconnect the first, rather than erroring loudly). Leave this
+            as a short, human-readable prefix; don't add your own unique
+            suffix here.
 
     config MQTT_USERNAME
         string "MQTT username"
@@ -162,6 +171,68 @@ menu "HD-WF1 MQTT"
             'Prefix REST paths with this device's WiFi MAC') is independent
             of this setting. Disable for the legacy flat hub75/<topic>
             scheme (fine for a single board on a broker).
+
+endmenu
+
+menu "HD-WF1 Default Text"
+
+    config DEFAULT_TEXT
+        string "Default text to display"
+        default ""
+        help
+            Shown on the panel (DisplayMode::kMessage) before any
+            hub75/message MQTT/REST command has ever been received - see
+            display_text in main.cpp. Leave empty to show a blank
+            screen/scroll until a real message arrives. A later
+            hub75/message command overwrites this text (and its color)
+            for the rest of that boot; there's no way back to this default
+            without a reboot.
+
+    choice DEFAULT_TEXT_FONT
+        prompt "Default text font"
+        default DEFAULT_TEXT_FONT_8X8
+        help
+            Font used to render DisplayMode::kMessage - both this default
+            text and any text later sent via hub75/message share the same
+            renderer, so this choice affects both, not just the boot
+            default.
+
+        config DEFAULT_TEXT_FONT_8X8
+            bool "8x8 (full ASCII, scrolls)"
+            help
+                font8x8_basic.h - covers the full printable ASCII range.
+                Scrolls right-to-left when wider than the panel, same as
+                every hub75/message today.
+
+        config DEFAULT_TEXT_FONT_SMALL
+            bool "Compact 3x5 (fits without scrolling)"
+            help
+                The same narrow font used for the WiFi status screen (see
+                small_font_glyph() in main.cpp) - deliberately covers only
+                digits, space, '.', '=', and the specific letters those
+                fixed status messages use. Any other character (most
+                consonants and all uppercase letters) renders as blank
+                space, so this is only safe for short text you've checked
+                against small_font_glyph()'s switch statement - risky for
+                arbitrary sentences. Centered, does not scroll; text wider
+                than the panel is simply clipped.
+    endchoice
+
+    config DEFAULT_TEXT_FG
+        string "Default text foreground color (#RRGGBB)"
+        default "#00FF00"
+        help
+            Hex color, same "#RRGGBB" format as other hub75/* JSON color
+            fields. Invalid or empty falls back to green (#00FF00) at boot.
+
+    config DEFAULT_TEXT_BG
+        string "Default text background color (#RRGGBB)"
+        default "#000000"
+        help
+            Hex color for the panel background behind DisplayMode::kMessage
+            text (both this default and any later hub75/message, per
+            'Default text font' above - there's no separate per-message bg
+            field today). Invalid or empty falls back to black (#000000).
 
 endmenu
 
