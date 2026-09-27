@@ -20,6 +20,7 @@
 
 #include "cJSON.h"
 #include "driver/gpio.h"
+#include "esp_app_desc.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_mac.h"
@@ -103,6 +104,7 @@ bool ntp_synced = false;
 // automatic/periodic ones) and should take over the display with the "TIME
 // SET" confirmation. Consumed (reset to false) by ntp_sync_cb() itself.
 bool ntp_manual_resync_requested = false;
+int64_t ntp_blink_end_us = 0;  // render loop blinks the lower-right pixel green until this esp_timer time
 
 // hub75/clock.<zone>.<color>: which zone the clock renders in - default
 // Pacific per the initial requirement (see apply_clock_tz()/ntp_init()).
@@ -115,6 +117,11 @@ constexpr const char *kClockTzPosix[] = {
 };
 ClockTz clock_tz = ClockTz::kPacific;
 uint8_t clock_color_r = 255, clock_color_g = 255, clock_color_b = 255;
+// Optional Chilanka-font clock (HH:MM as four big digits, see draw_chilanka_number()), chosen by a
+// {"font":"chilanka","fg":..,"bg":..,"hue":..} payload on any hub75/clock* command. false = the classic
+// scrolling 8x8 HH:MM:SS clock in clock_color_*.
+bool clock_chilanka = false;
+uint8_t clock_fg[3] = {255, 255, 255}, clock_bg[3] = {0, 0, 0}, clock_hue[3] = {255, 255, 255};
 
 // Solid full-panel color, shown while display_mode == kSolidColor - set by
 // the hub75/red, hub75/green, hub75/blue, hub75/yellow, hub75/orange topics.
@@ -178,6 +185,7 @@ enum class DisplayMode {
   kMaze3,
   kMaze4,
   kMaze5,
+  kMaze99,
   kPing1,
   kPing2,
   kMatrixRain,
@@ -998,7 +1006,8 @@ constexpr const char *kBrightTopic = "hub75/bright";
 // 50% (128) barely reads as dimmer to the eye - dropping much lower makes
 // the dim/bright difference actually obvious.
 constexpr uint8_t kDimBrightness = 32;     // ~12.5%
-constexpr uint8_t kFullBrightness = 255;   // 100%
+constexpr uint8_t kFullBrightness = CONFIG_MAX_BRIGHTNESS;  // "bright" - capped, see menuconfig 'HD-WF1 Power'
+constexpr uint8_t kBrightnessRampStep = 8;  // max brightness increase per ~30ms tick (~1s for a full swing)
 
 // Solid full-panel colors - payload ignored, topic alone selects the color.
 constexpr const char *kRedTopic = "hub75/red";
@@ -1057,6 +1066,9 @@ constexpr const char *kMaze2Topic = "hub75/maze2";
 constexpr const char *kMaze3Topic = "hub75/maze3";
 constexpr const char *kMaze4Topic = "hub75/maze4";
 constexpr const char *kMaze5Topic = "hub75/maze5";
+// Not gated behind HUB75_FULL_EFFECTS - unlike maze4/5, it needs no background ping task, and it's a
+// requested feature in its own right rather than an extra "effect", so it stays live in the lean build.
+constexpr const char *kMaze99Topic = "hub75/maze99";
 
 // hub75/ping1: a scrolling network-latency strip-chart (see ping1_task()
 // and the state declared alongside it, and DisplayMode::kPing1 in the
@@ -1222,15 +1234,55 @@ void set_number_l(const char *data, int data_len, const char *digits) {
            bg[2], hue[0], hue[1], hue[2]);
 }
 
-void set_clock_tz_color(ClockTz tz, uint8_t r, uint8_t g, uint8_t b, const char *name) {
+// Shared by every hub75/clock* command. `tz`/`rgb` are null to keep the current zone/color (plain
+// hub75/clock). The payload is optional JSON: {"font":"chilanka","fg":"#RRGGBB","bg":"#RRGGBB",
+// "hue":"#RRGGBB"}; an empty payload (or no "font":"chilanka") gives the classic clock. In Chilanka mode
+// fg defaults to the command's clock color, bg to black, hue to none.
+void set_clock(const ClockTz *tz, const uint8_t *rgb, const char *data, int data_len, const char *name) {
+  uint8_t fg[3], bg[3] = {0, 0, 0}, hue[3] = {255, 255, 255};
+  bool chilanka = false;
   xSemaphoreTake(display_mutex, portMAX_DELAY);
-  clock_tz = tz;
-  clock_color_r = r;
-  clock_color_g = g;
-  clock_color_b = b;
+  fg[0] = rgb ? rgb[0] : clock_color_r;
+  fg[1] = rgb ? rgb[1] : clock_color_g;
+  fg[2] = rgb ? rgb[2] : clock_color_b;
+  xSemaphoreGive(display_mutex);
+  if (data != nullptr && data_len > 0) {
+    cJSON *root = cJSON_ParseWithLength(data, data_len);
+    if (root != nullptr) {
+      const cJSON *font = cJSON_GetObjectItemCaseSensitive(root, "font");
+      chilanka = cJSON_IsString(font) && strcmp(font->valuestring, "chilanka") == 0;
+      const struct {
+        const char *key;
+        uint8_t *dst;
+      } fields[] = {{"fg", fg}, {"bg", bg}, {"hue", hue}};
+      for (const auto &f : fields) {
+        const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, f.key);
+        if (cJSON_IsString(item)) parse_hex_color(item->valuestring, &f.dst[0], &f.dst[1], &f.dst[2]);
+      }
+      cJSON_Delete(root);
+    } else {
+      ESP_LOGW(MQTT_TAG, "clock: payload is not valid JSON, using the classic clock");
+    }
+  }
+  xSemaphoreTake(display_mutex, portMAX_DELAY);
+  if (tz) clock_tz = *tz;
+  if (rgb) {
+    clock_color_r = rgb[0];
+    clock_color_g = rgb[1];
+    clock_color_b = rgb[2];
+  }
+  clock_chilanka = chilanka;
+  memcpy(clock_fg, fg, 3);
+  memcpy(clock_bg, bg, 3);
+  memcpy(clock_hue, hue, 3);
   display_mode = DisplayMode::kClock;
   xSemaphoreGive(display_mutex);
-  ESP_LOGI(MQTT_TAG, "switched to %s", name);
+  ESP_LOGI(MQTT_TAG, "switched to %s%s", name, chilanka ? " [chilanka font]" : "");
+}
+
+void set_clock_tz_color(ClockTz tz, uint8_t r, uint8_t g, uint8_t b, const char *name, const char *data, int data_len) {
+  const uint8_t rgb[3] = {r, g, b};
+  set_clock(&tz, rgb, data, data_len, name);
 }
 
 void set_brightness(uint8_t brightness) {
@@ -1280,7 +1332,7 @@ void random_color(uint8_t *r, uint8_t *g, uint8_t *b, uint8_t base = 0, uint16_t
 // identically. Returns false if `topic` is not a known/live command. Topics
 // gated by HUB75_FULL_EFFECTS are only recognised when that is enabled, same
 // as their MQTT subscriptions.
-bool dispatch_command(const char *topic, int topic_len, const char *data, int data_len) {
+bool dispatch_command_impl(const char *topic, int topic_len, const char *data, int data_len) {
   char number_digits[kNumberLMaxDigits + 1];
   if (topic_matches(topic, topic_len, CONFIG_MQTT_MESSAGE_TOPIC)) {
     handle_message_payload(data, data_len);
@@ -1336,6 +1388,8 @@ bool dispatch_command(const char *topic, int topic_len, const char *data, int da
     set_test_mode(DisplayMode::kMaze2, "maze2 (hub75/maze2)");
   } else if (topic_matches(topic, topic_len, kMaze3Topic)) {
     set_test_mode(DisplayMode::kMaze3, "maze3 (hub75/maze3)");
+  } else if (topic_matches(topic, topic_len, kMaze99Topic)) {
+    set_test_mode(DisplayMode::kMaze99, "maze99 (hub75/maze99)");
 #if HUB75_FULL_EFFECTS
   } else if (topic_matches(topic, topic_len, kMaze4Topic)) {
     set_test_mode(DisplayMode::kMaze4, "maze4 (hub75/maze4)");
@@ -1411,7 +1465,7 @@ bool dispatch_command(const char *topic, int topic_len, const char *data, int da
     set_test_mode(DisplayMode::kElevatorXLarge, "elevator x-large (hub75/2LL)");
 #endif
   } else if (topic_matches(topic, topic_len, kClockTopic)) {
-    set_test_mode(DisplayMode::kClock, "clock (hub75/clock)");
+    set_clock(nullptr, nullptr, data, data_len, "clock (hub75/clock)");
   } else if (topic_matches(topic, topic_len, kNtpSetTopic)) {
     ESP_LOGI(MQTT_TAG, "hub75/ntpset: forcing NTP resync");
     xSemaphoreTake(display_mutex, portMAX_DELAY);
@@ -1419,21 +1473,113 @@ bool dispatch_command(const char *topic, int topic_len, const char *data, int da
     xSemaphoreGive(display_mutex);
     esp_netif_sntp_start();
   } else if (topic_matches(topic, topic_len, kClockPacificTopic)) {
-    set_clock_tz_color(ClockTz::kPacific, 0, 0, 255, "clock (hub75/clock.PST8PDT.blue)");
+    set_clock_tz_color(ClockTz::kPacific, 0, 0, 255, "clock (hub75/clock.PST8PDT.blue)", data, data_len);
   } else if (topic_matches(topic, topic_len, kClockIndiaTopic)) {
-    set_clock_tz_color(ClockTz::kIndia, 0, 0, 255, "clock (hub75/clock.IST.blue)");
+    set_clock_tz_color(ClockTz::kIndia, 0, 0, 255, "clock (hub75/clock.IST.blue)", data, data_len);
   } else if (topic_matches(topic, topic_len, kClockUtcTopic)) {
-    set_clock_tz_color(ClockTz::kUtc, 0, 255, 0, "clock (hub75/clock.utc.green)");
+    set_clock_tz_color(ClockTz::kUtc, 0, 255, 0, "clock (hub75/clock.utc.green)", data, data_len);
   } else if (topic_matches(topic, topic_len, kClockMountainTopic)) {
-    set_clock_tz_color(ClockTz::kMountain, 0, 0, 255, "clock (hub75/clock.mountain.blue)");
+    set_clock_tz_color(ClockTz::kMountain, 0, 0, 255, "clock (hub75/clock.mountain.blue)", data, data_len);
   } else if (topic_matches(topic, topic_len, kClockCentralTopic)) {
-    set_clock_tz_color(ClockTz::kCentral, 0, 0, 255, "clock (hub75/clock.central.blue)");
+    set_clock_tz_color(ClockTz::kCentral, 0, 0, 255, "clock (hub75/clock.central.blue)", data, data_len);
   } else if (topic_matches(topic, topic_len, kClockEasternTopic)) {
-    set_clock_tz_color(ClockTz::kEastern, 0, 0, 255, "clock (hub75/clock.eastern.blue)");
+    set_clock_tz_color(ClockTz::kEastern, 0, 0, 255, "clock (hub75/clock.eastern.blue)", data, data_len);
   } else {
   return false;
   }
   return true;
+}
+
+// ---- Save / restore what the panel shows across reboots ---------------------
+// Every successful command is remembered in RAM: the last "content" command
+// (colour, message, number, effect, clock, off - anything that picks what is
+// drawn) and the last brightness command (dim/bright). save_current_display()
+// writes both to NVS; restore_saved_display() replays them at boot, before the
+// render loop starts, so the saved screen comes up immediately (even with no
+// WiFi) and the WiFi-status screen / 15s fallback never override it.
+// flash/noflash/ntpset are modifiers, not content, and are not remembered.
+constexpr const char *kSaveNs = "hub75_saved";
+char last_content_topic[64] = "";
+char last_content_body[512] = "";
+char last_brightness_topic[24] = "";
+portMUX_TYPE last_cmd_mux = portMUX_INITIALIZER_UNLOCKED;
+
+bool dispatch_command(const char *topic, int topic_len, const char *data, int data_len) {
+  if (!dispatch_command_impl(topic, topic_len, data, data_len)) return false;
+  if (topic_len <= 0 || topic_len >= static_cast<int>(sizeof(last_content_topic))) return true;
+  const bool is_bright = topic_matches(topic, topic_len, kDimTopic) || topic_matches(topic, topic_len, kBrightTopic);
+  const bool is_modifier = topic_matches(topic, topic_len, kFlashTopic) || topic_matches(topic, topic_len, kNoFlashTopic) ||
+                           topic_matches(topic, topic_len, kNtpSetTopic);
+  if (is_modifier) return true;
+  taskENTER_CRITICAL(&last_cmd_mux);
+  if (is_bright) {
+    snprintf(last_brightness_topic, sizeof(last_brightness_topic), "%.*s", topic_len, topic);
+  } else {
+    snprintf(last_content_topic, sizeof(last_content_topic), "%.*s", topic_len, topic);
+    const int n = (data != nullptr && data_len > 0) ? (data_len < 511 ? data_len : 511) : 0;
+    if (n > 0) memcpy(last_content_body, data, n);
+    last_content_body[n] = '\0';
+  }
+  taskEXIT_CRITICAL(&last_cmd_mux);
+  return true;
+}
+
+esp_err_t saved_display_nvs_init() {
+  esp_err_t err = nvs_flash_init();  // no-op (ESP_OK) if wifi_init() already did it
+  if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    ESP_ERROR_CHECK(nvs_flash_erase());
+    err = nvs_flash_init();
+  }
+  return err;
+}
+
+// Returns ESP_ERR_INVALID_STATE if nothing has been shown yet.
+esp_err_t save_current_display(char *saved_topic, size_t saved_topic_len) {
+  char topic[sizeof(last_content_topic)], body[sizeof(last_content_body)], bright[sizeof(last_brightness_topic)];
+  taskENTER_CRITICAL(&last_cmd_mux);
+  memcpy(topic, last_content_topic, sizeof(topic));
+  memcpy(body, last_content_body, sizeof(body));
+  memcpy(bright, last_brightness_topic, sizeof(bright));
+  taskEXIT_CRITICAL(&last_cmd_mux);
+  if (topic[0] == '\0') return ESP_ERR_INVALID_STATE;
+  nvs_handle_t h;
+  esp_err_t err = nvs_open(kSaveNs, NVS_READWRITE, &h);
+  if (err != ESP_OK) return err;
+  err = nvs_set_str(h, "topic", topic);
+  if (err == ESP_OK) err = nvs_set_str(h, "body", body);
+  if (err == ESP_OK) err = nvs_set_str(h, "bright", bright);
+  if (err == ESP_OK) err = nvs_commit(h);
+  nvs_close(h);
+  if (err == ESP_OK) strlcpy(saved_topic, topic, saved_topic_len);
+  return err;
+}
+
+esp_err_t clear_saved_display() {
+  nvs_handle_t h;
+  esp_err_t err = nvs_open(kSaveNs, NVS_READWRITE, &h);
+  if (err != ESP_OK) return err;
+  err = nvs_erase_all(h);
+  if (err == ESP_OK) err = nvs_commit(h);
+  nvs_close(h);
+  return err;
+}
+
+void restore_saved_display() {
+  if (saved_display_nvs_init() != ESP_OK) return;
+  nvs_handle_t h;
+  if (nvs_open(kSaveNs, NVS_READONLY, &h) != ESP_OK) return;
+  char topic[sizeof(last_content_topic)] = "", body[sizeof(last_content_body)] = "", bright[sizeof(last_brightness_topic)] = "";
+  size_t n = sizeof(topic);
+  const bool have = nvs_get_str(h, "topic", topic, &n) == ESP_OK && topic[0] != '\0';
+  n = sizeof(body);
+  nvs_get_str(h, "body", body, &n);
+  n = sizeof(bright);
+  nvs_get_str(h, "bright", bright, &n);
+  nvs_close(h);
+  if (!have) return;
+  ESP_LOGI(TAG, "restoring saved display: %s (brightness: %s)", topic, bright[0] ? bright : "default");
+  if (bright[0]) dispatch_command(bright, static_cast<int>(strlen(bright)), "", 0);
+  dispatch_command(topic, static_cast<int>(strlen(topic)), body, static_cast<int>(strlen(body)));
 }
 
 // Wire-level replacement for the "hub75/" prefix - "hub75/<device_id_hex>/"
@@ -1591,6 +1737,9 @@ static const char *HTTP_TAG = "hub75_http";
 // it to find <name>.
 char http_command_prefix[48] = "/api/command/";
 char http_status_path[32] = "/api/status";
+char http_info_path[32] = "/api/info";
+char http_save_path[32] = "/api/save";
+char http_unsave_path[32] = "/api/unsave";
 
 bool http_authorized(httpd_req_t *req) {
   if (strlen(CONFIG_HTTP_API_TOKEN) == 0) return true;
@@ -1667,6 +1816,62 @@ esp_err_t http_status_handler(httpd_req_t *req) {
   return http_send_json(req, "200 OK", json);
 }
 
+// GET .../info - static device facts so a client (the Android programmer app)
+// can adapt its UI: panel size, whether the full effect set is compiled in.
+esp_err_t http_info_handler(httpd_req_t *req) {
+  if (!http_authorized(req)) {
+    httpd_resp_set_hdr(req, "WWW-Authenticate", "Bearer");
+    return http_send_json(req, "401 Unauthorized", "{\"ok\":false,\"error\":\"unauthorized\"}");
+  }
+  char json[192];
+  snprintf(json, sizeof(json),
+           "{\"device_id\":\"%s\",\"width\":%d,\"height\":%d,\"full_effects\":%s,\"version\":\"%s\"}",
+           device_id_hex, PANEL_WIDTH, PANEL_HEIGHT, HUB75_FULL_EFFECTS ? "true" : "false",
+           esp_app_get_description()->version);
+  return http_send_json(req, "200 OK", json);
+}
+
+// POST .../save persists the current display (content + brightness) to NVS so
+// it is restored on every boot; POST .../unsave forgets it again.
+esp_err_t http_save_handler(httpd_req_t *req) {
+  if (!http_authorized(req)) {
+    httpd_resp_set_hdr(req, "WWW-Authenticate", "Bearer");
+    return http_send_json(req, "401 Unauthorized", "{\"ok\":false,\"error\":\"unauthorized\"}");
+  }
+  char topic[64], json[128];
+  const esp_err_t err = save_current_display(topic, sizeof(topic));
+  if (err == ESP_ERR_INVALID_STATE) {
+    return http_send_json(req, "409 Conflict", "{\"ok\":false,\"error\":\"nothing to save yet\"}");
+  }
+  if (err != ESP_OK) {
+    return http_send_json(req, "500 Internal Server Error", "{\"ok\":false,\"error\":\"nvs write failed\"}");
+  }
+  ESP_LOGI(HTTP_TAG, "saved display: %s", topic);
+  snprintf(json, sizeof(json), "{\"ok\":true,\"saved\":\"%s\"}", topic);
+  return http_send_json(req, "200 OK", json);
+}
+
+esp_err_t http_unsave_handler(httpd_req_t *req) {
+  if (!http_authorized(req)) {
+    httpd_resp_set_hdr(req, "WWW-Authenticate", "Bearer");
+    return http_send_json(req, "401 Unauthorized", "{\"ok\":false,\"error\":\"unauthorized\"}");
+  }
+  if (clear_saved_display() != ESP_OK) {
+    return http_send_json(req, "500 Internal Server Error", "{\"ok\":false,\"error\":\"nvs erase failed\"}");
+  }
+  return http_send_json(req, "200 OK", "{\"ok\":true}");
+}
+
+// GET /api/whoami - always at this fixed path, unauthenticated, so a client
+// can discover plaques on the LAN and learn the device ID needed for the
+// MAC-prefixed routes. Reveals nothing beyond the (broadcast) WiFi MAC.
+esp_err_t http_whoami_handler(httpd_req_t *req) {
+  char json[96];
+  snprintf(json, sizeof(json), "{\"device\":\"hd-wf1-hub75\",\"device_id\":\"%s\",\"auth\":%s}", device_id_hex,
+           strlen(CONFIG_HTTP_API_TOKEN) ? "true" : "false");
+  return http_send_json(req, "200 OK", json);
+}
+
 void http_api_init(void) {
 #if CONFIG_HTTP_API_ENABLE
   // wifi_init() skips esp_netif_init() entirely when WiFi is unconfigured,
@@ -1682,9 +1887,15 @@ void http_api_init(void) {
 #if CONFIG_HTTP_API_MAC_PREFIX
   snprintf(http_command_prefix, sizeof(http_command_prefix), "/api/%s/command/", device_id_hex);
   snprintf(http_status_path, sizeof(http_status_path), "/api/%s/status", device_id_hex);
+  snprintf(http_info_path, sizeof(http_info_path), "/api/%s/info", device_id_hex);
+  snprintf(http_save_path, sizeof(http_save_path), "/api/%s/save", device_id_hex);
+  snprintf(http_unsave_path, sizeof(http_unsave_path), "/api/%s/unsave", device_id_hex);
 #else
   strlcpy(http_command_prefix, "/api/command/", sizeof(http_command_prefix));
   strlcpy(http_status_path, "/api/status", sizeof(http_status_path));
+  strlcpy(http_info_path, "/api/info", sizeof(http_info_path));
+  strlcpy(http_save_path, "/api/save", sizeof(http_save_path));
+  strlcpy(http_unsave_path, "/api/unsave", sizeof(http_unsave_path));
 #endif
 
   httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
@@ -1709,6 +1920,14 @@ void http_api_init(void) {
   httpd_register_uri_handler(server, &command_post);
   httpd_register_uri_handler(server, &command_put);
   httpd_register_uri_handler(server, &status_get);
+  const httpd_uri_t info_get = {http_info_path, HTTP_GET, http_info_handler, nullptr};
+  httpd_register_uri_handler(server, &info_get);
+  const httpd_uri_t save_post = {http_save_path, HTTP_POST, http_save_handler, nullptr};
+  const httpd_uri_t unsave_post = {http_unsave_path, HTTP_POST, http_unsave_handler, nullptr};
+  httpd_register_uri_handler(server, &save_post);
+  httpd_register_uri_handler(server, &unsave_post);
+  const httpd_uri_t whoami_get = {"/api/whoami", HTTP_GET, http_whoami_handler, nullptr};
+  httpd_register_uri_handler(server, &whoami_get);
   ESP_LOGI(HTTP_TAG, "REST API listening on port %d, commands at %s*, status at %s%s", CONFIG_HTTP_API_PORT,
            http_command_prefix, http_status_path, strlen(CONFIG_HTTP_API_TOKEN) ? " (token required)" : " (NO AUTH)");
 #endif
@@ -1726,6 +1945,7 @@ void ntp_sync_cb(struct timeval *tv) {
   (void)tv;
   xSemaphoreTake(display_mutex, portMAX_DELAY);
   ntp_synced = true;
+  ntp_blink_end_us = esp_timer_get_time() + 4000000;  // confirm the sync: blink the corner pixel ~4s
   if (ntp_manual_resync_requested) {
     display_mode = DisplayMode::kClockConfirm;
     ntp_manual_resync_requested = false;  // consumed
@@ -2174,6 +2394,7 @@ const uint8_t *small_font_glyph(char c) {
   static const uint8_t kColon[5] = {0, 2, 0, 2, 0};
   static const uint8_t kLowerH[5] = {1, 1, 3, 5, 5};
   static const uint8_t kLowerU[5] = {0, 5, 5, 5, 6};
+  static const uint8_t kLowerV[5] = {0, 5, 5, 5, 2};
   static const uint8_t kLowerB[5] = {1, 1, 3, 5, 3};
   static const uint8_t kSlash[5] = {4, 4, 2, 1, 1};
   static const uint8_t kUpperI[5] = {7, 2, 2, 2, 7};
@@ -2240,6 +2461,7 @@ const uint8_t *small_font_glyph(char c) {
     case 'p': return kLowerP;
     case 'h': return kLowerH;
     case 'u': return kLowerU;
+    case 'v': return kLowerV;
     case 'b': return kLowerB;
     default: return kSpace;
   }
@@ -2429,8 +2651,10 @@ void draw_time_hhmmss(int16_t x, int16_t y, int hour, int minute, int second, ui
 // digits can scroll in/out of existence at 9->10 and 99->100 (and back)
 // without special-casing. scale nearest-neighbor upscales the source 8x8
 // glyph (2 = render each source pixel as a 2x2 block, etc).
+// fill_bg: also writes the unlit pixels as black, so the cell can be redrawn over its previous contents
+// without a clear first (no visible blank frame on the single-buffered panel).
 void draw_digit_scroll(int16_t x, int16_t y, char old_c, char new_c, int t, bool up, uint8_t r, uint8_t g, uint8_t b,
-                        int scale) {
+                        int scale, bool fill_bg = false) {
   const uint8_t *old_glyph = kFont8x8Basic[static_cast<unsigned char>(old_c)];
   const uint8_t *new_glyph = kFont8x8Basic[static_cast<unsigned char>(new_c)];
   const int dh = 8 * scale;
@@ -2442,10 +2666,12 @@ void draw_digit_scroll(int16_t x, int16_t y, char old_c, char new_c, int t, bool
     const int16_t py = y + row;
     if (py < 0 || py >= PANEL_HEIGHT) continue;
     for (int col = 0; col < dh; col++) {
-      if ((bits & (1 << (col / scale))) == 0) continue;
+      const bool lit = (bits & (1 << (col / scale))) != 0;
+      if (!lit && !fill_bg) continue;
       const int16_t px = x + col;
       if (px < 0 || px >= PANEL_WIDTH) continue;
-      dma_display->drawPixelRGB888(px, py, r, g, b);
+      if (lit) dma_display->drawPixelRGB888(px, py, r, g, b);
+      else dma_display->drawPixelRGB888(px, py, 0, 0, 0);
     }
   }
 }
@@ -2601,7 +2827,7 @@ extern "C" void app_main(void)
 {
     applog_init();
     ESP_LOGI("applog", "===== BOOT (reset reason above/below) =====");
-    ESP_LOGI(TAG, "boot, reset reason=%d", esp_reset_reason());
+    ESP_LOGI(TAG, "boot, firmware %s, reset reason=%d", esp_app_get_description()->version, esp_reset_reason());
 
     display_mutex = xSemaphoreCreateMutex();
 
@@ -2644,6 +2870,10 @@ extern "C" void app_main(void)
     // very first thing drawn (the owner-info splash)
     // should come up gentle rather than at full brightness.
     dma_display->setBrightness8(kDimBrightness);
+
+    // Replay whatever was last saved via POST /api/<mac>/save (see
+    // restore_saved_display()); does nothing if nothing was ever saved.
+    restore_saved_display();
 
     // Onboard button (see WF1_BUTTON_PIN above) - active-low, so an internal
     // pull-up keeps it reading HIGH (unpressed) with nothing else attached.
@@ -2923,7 +3153,53 @@ extern "C" void app_main(void)
     constexpr int kClockDotBlinkTicks = 17;  // 17 * 30ms ~= 500ms per phase
     int clock_dot_tick = 0;
 
-    auto run_clock_frame = [&](bool ntp_ok, ClockTz tz, uint8_t clock_r, uint8_t clock_g, uint8_t clock_b) {
+    // The clock never clears the panel between frames (a clear + full redraw every 30ms visibly flickers on
+    // this single-buffered panel). `full` means the caller just cleared the screen (mode change, blink), so
+    // everything is drawn; otherwise only the digit cells that are changing and the blinking NTP dot are
+    // touched, and everything else stays as it was.
+    bool clock_slot_dirty[6] = {true, true, true, true, true, true};
+    bool clock_dot_on = false;
+    uint8_t clock_last_r = 0, clock_last_g = 0, clock_last_b = 0;
+    ClockTz clock_last_tz = ClockTz::kUtc;
+    bool clock_was_chilanka = false;
+    uint32_t clock_chilanka_key = 0;
+    auto run_clock_frame = [&](bool ntp_ok, ClockTz tz, uint8_t clock_r, uint8_t clock_g, uint8_t clock_b, bool full,
+                               bool chilanka, const uint8_t *cfg, const uint8_t *cbg, const uint8_t *chue) {
+        if (chilanka) {
+            // HH:MM as four Chilanka digits, redrawn only when the minute (or a color) changes; the draw
+            // starts with a full-panel fill, so no separate clear is needed.
+            apply_clock_tz(tz);
+            const time_t now_c = time(nullptr);
+            struct tm tm_c;
+            localtime_r(&now_c, &tm_c);
+            const char hhmm[5] = {static_cast<char>('0' + tm_c.tm_hour / 10), static_cast<char>('0' + tm_c.tm_hour % 10),
+                                  static_cast<char>('0' + tm_c.tm_min / 10), static_cast<char>('0' + tm_c.tm_min % 10), 0};
+            uint32_t key = 2166136261u;
+            for (int i = 0; i < 4; i++) key = (key ^ static_cast<uint8_t>(hhmm[i])) * 16777619u;
+            for (int i = 0; i < 3; i++) key = (key ^ cfg[i]) * 16777619u, key = (key ^ cbg[i]) * 16777619u,
+                                        key = (key ^ chue[i]) * 16777619u;
+            if (full || !clock_was_chilanka || key != clock_chilanka_key) {
+                draw_chilanka_number(hhmm, cfg, cbg, chue);
+                clock_chilanka_key = key;
+            }
+            clock_was_chilanka = true;
+            return;
+        }
+        if (clock_was_chilanka) {  // just switched back to the classic clock: repaint it from scratch
+            dma_display->clearScreen();
+            clock_was_chilanka = false;
+            full = true;
+        }
+        if (!full && (clock_r != clock_last_r || clock_g != clock_last_g || clock_b != clock_last_b ||
+                      tz != clock_last_tz)) {
+            dma_display->clearScreen();  // new color/zone: repaint everything once
+            full = true;
+        }
+        clock_last_r = clock_r; clock_last_g = clock_g; clock_last_b = clock_b; clock_last_tz = tz;
+        if (full) {
+            for (int i = 0; i < 6; i++) clock_slot_dirty[i] = true;
+            clock_dot_on = false;
+        }
         // Reapplied every frame (cheap - just parses a short string) rather
         // than cached, since hub75/time also drives the process-wide TZ for
         // its own dual-zone display - a cache here could go stale behind
@@ -2949,22 +3225,32 @@ extern "C" void app_main(void)
                 clock_digit_old[i] = clock_digit_cur[i];
                 clock_digit_cur[i] = new_digits[i];
                 clock_anim_tick[i] = 0;
+                clock_slot_dirty[i] = true;
             }
             const int t = clock_anim_tick[i] < kClockAnimTicks ? clock_anim_tick[i] : kClockAnimTicks;
-            draw_digit_scroll(kClockSlotX[i], kClockY, clock_digit_old[i], clock_digit_cur[i], t, true, clock_r,
-                               clock_g, clock_b, 1);
+            if (clock_slot_dirty[i]) {
+                draw_digit_scroll(kClockSlotX[i], kClockY, clock_digit_old[i], clock_digit_cur[i], t, true, clock_r,
+                                   clock_g, clock_b, 1, true);
+                if (t >= kClockAnimTicks) clock_slot_dirty[i] = false;  // final frame of the scroll drawn
+            }
             if (clock_anim_tick[i] < kClockAnimTicks) clock_anim_tick[i]++;
         }
-        for (int i = 0; i < 2; i++) {
-            dma_display->fillRect(kClockColonX[i], kClockY + 2, 2, 2, clock_r, clock_g, clock_b);
-            dma_display->fillRect(kClockColonX[i], kClockY + 5, 2, 2, clock_r, clock_g, clock_b);
+        if (full) {
+            for (int i = 0; i < 2; i++) {
+                dma_display->fillRect(kClockColonX[i], kClockY + 2, 2, 2, clock_r, clock_g, clock_b);
+                dma_display->fillRect(kClockColonX[i], kClockY + 5, 2, 2, clock_r, clock_g, clock_b);
+            }
         }
+        bool want_dot = false;
         if (ntp_ok) {
             if (++clock_dot_tick >= 2 * kClockDotBlinkTicks) clock_dot_tick = 0;
-            if (clock_dot_tick < kClockDotBlinkTicks) {
-                dma_display->fillRect(kClockDotX0, kClockDotY, kClockDotSize, kClockDotSize, 0, 255, 0);
-                dma_display->fillRect(kClockDotX1, kClockDotY, kClockDotSize, kClockDotSize, 0, 255, 0);
-            }
+            want_dot = clock_dot_tick < kClockDotBlinkTicks;
+        }
+        if (want_dot != clock_dot_on) {  // only touch the dot when it toggles
+            clock_dot_on = want_dot;
+            const uint8_t g = want_dot ? 255 : 0;
+            dma_display->fillRect(kClockDotX0, kClockDotY, kClockDotSize, kClockDotSize, 0, g, 0);
+            dma_display->fillRect(kClockDotX1, kClockDotY, kClockDotSize, kClockDotSize, 0, g, 0);
         }
     };
 
@@ -3938,6 +4224,265 @@ extern "C" void app_main(void)
         }
     };
 
+    // ---------------------------------------------------------------------
+    // hub75/maze99 - ported from the TI-99/4A assembly original (see
+    // ../maze_a99/micmz2.a99): a random perfect maze built with Wilson's
+    // algorithm (every possible maze equally likely, unlike maze1-5's
+    // randomized-DFS carve, which favours long corridors), raced by two
+    // balls - red keeping its right hand on the wall, blue its left -
+    // each dragging a fading tail behind it. First one home wins the
+    // round (both arriving on the same tick is a tie); a running
+    // red/tie/blue tally is kept for as long as this mode stays active
+    // and shown briefly between rounds. Unlike the original, there is no
+    // "preparing next maze" progress screen: an ESP32 carves this size of
+    // maze instantly, so (per the original's own text mode/bitmap-mode
+    // switch cost) that screen would have nothing to show.
+    //
+    // Shares maze_wall_right/down/cols/rows/off_x/off_y/cell_pitch/
+    // cell_size and draw_maze_walls() with the maze1-5 family above -
+    // configure_maze(false) (maze1's 3px paths) gives enough room for a
+    // filled-cell ball plus its tail. maze_solve_visited is reused as
+    // Wilson's "already in the tree" scratch grid, the same trick
+    // generate_maze() above plays with it for its own DFS visited set.
+    constexpr int kMaze99TailCount = 3;
+    constexpr int kMaze99TailStepFrames = 3;   // frames between two trailing dots
+    constexpr int kMaze99HistLen = 64;         // > TailCount * TailStepFrames
+    constexpr int kMaze99HoldTicks = 60;       // ~1.8s pause once a round ends, same pace as maze1-5
+    constexpr int16_t kMaze99Dx[4] = {0, 1, 0, -1};  // 0 up, 1 right, 2 down, 3 left
+    constexpr int16_t kMaze99Dy[4] = {-1, 0, 1, 0};
+    static int8_t maze99_walk_dir[kMazeMaxCols][kMazeMaxRows];  // Wilson's per-cell "last way out" during a walk
+    bool maze99_primed = false;
+    bool maze99_solved = false;
+    int maze99_hold_tick = 0;
+    int maze99_wins[2] = {0, 0};  // [0] red, [1] blue
+    int maze99_ties = 0;
+    int maze99_cx[2] = {0, 0}, maze99_cy[2] = {0, 0};
+    int maze99_dir[2] = {1, 1};             // both start facing right, out of the top-left cell
+    const int maze99_hand[2] = {1, -1};     // red: right hand (+1 = clockwise); blue: left hand (-1)
+    int16_t maze99_pix_x[2] = {0, 0}, maze99_pix_y[2] = {0, 0};
+    int16_t maze99_target_x[2] = {0, 0}, maze99_target_y[2] = {0, 0};
+    bool maze99_done[2] = {false, false};
+    int16_t maze99_hist_x[2][kMaze99HistLen] = {{0}};
+    int16_t maze99_hist_y[2][kMaze99HistLen] = {{0}};
+    int maze99_hist_head[2] = {0, 0};
+    // Previous frame's drawn pixels, so they can be erased before the new
+    // position is drawn - same erase-then-redraw approach as maze_dot_prev_*
+    // above, needed to avoid a full clearScreen() flicker on this
+    // single-buffered panel (see draw_maze_walls()'s and run_maze_frame()'s
+    // comments on this).
+    int16_t maze99_prev_ball_x[2] = {0, 0}, maze99_prev_ball_y[2] = {0, 0};
+    int16_t maze99_prev_tail_x[2][kMaze99TailCount], maze99_prev_tail_y[2][kMaze99TailCount];
+    bool maze99_prev_tail_valid[2][kMaze99TailCount] = {{false}};
+    bool maze99_prev_ball_valid[2] = {false, false};
+
+    // Like pick_maze_wall_color(), but also excludes blue - maze99 has both
+    // a red and a blue ball, so walls avoid reading as either.
+    auto pick_maze99_wall_color = [&]() {
+        do {
+            maze_wall_r = static_cast<uint8_t>(esp_random() % 256);
+            maze_wall_g = static_cast<uint8_t>(esp_random() % 256);
+            maze_wall_b = static_cast<uint8_t>(esp_random() % 256);
+        } while ((maze_wall_r > 160 && maze_wall_g < 110 && maze_wall_b < 110) ||
+                 (maze_wall_b > 160 && maze_wall_r < 110 && maze_wall_g < 110));
+    };
+
+    // Wilson's algorithm: pick a random root cell already "in the tree";
+    // for every other cell, take a loop-erased random walk (recording only
+    // the latest exit direction taken from each cell visited along the way
+    // - overwriting it on a revisit erases the loop for free) until the
+    // walk reaches the tree, then follow those recorded directions from the
+    // start, adding each cell to the tree and carving its wall as it goes.
+    // Every possible spanning tree (maze) is equally likely - see
+    // ../maze_a99/micmz2.a99's own comment on why that matters for a fair
+    // two-hand race.
+    auto generate_maze99 = [&]() {
+        dma_display->clearScreen();
+        for (int i = 0; i < 2; i++) {
+            maze99_prev_ball_valid[i] = false;
+            for (int k = 0; k < kMaze99TailCount; k++) maze99_prev_tail_valid[i][k] = false;
+        }
+        pick_maze99_wall_color();
+        for (int c = 0; c < maze_cols; c++) {
+            for (int r = 0; r < maze_rows; r++) {
+                maze_wall_right[c][r] = true;
+                maze_wall_down[c][r] = true;
+            }
+        }
+        auto &in_tree = maze_solve_visited;  // reused scratch, see the comment block above
+        for (int c = 0; c < maze_cols; c++)
+            for (int r = 0; r < maze_rows; r++) in_tree[c][r] = false;
+        const int root_c = static_cast<int>(esp_random() % maze_cols);
+        const int root_r = static_cast<int>(esp_random() % maze_rows);
+        in_tree[root_c][root_r] = true;
+        for (int sr = 0; sr < maze_rows; sr++) {
+            for (int sc = 0; sc < maze_cols; sc++) {
+                if (in_tree[sc][sr]) continue;
+                int c = sc, r = sr;
+                while (!in_tree[c][r]) {
+                    int dir, nc, nr;
+                    do {
+                        dir = static_cast<int>(esp_random() % 4);
+                        nc = c + kMaze99Dx[dir];
+                        nr = r + kMaze99Dy[dir];
+                    } while (nc < 0 || nc >= maze_cols || nr < 0 || nr >= maze_rows);
+                    maze99_walk_dir[c][r] = static_cast<int8_t>(dir);
+                    c = nc;
+                    r = nr;
+                }
+                c = sc;
+                r = sr;
+                while (!in_tree[c][r]) {
+                    in_tree[c][r] = true;
+                    const int dir = maze99_walk_dir[c][r];
+                    const int nc = c + kMaze99Dx[dir], nr = r + kMaze99Dy[dir];
+                    if (dir == 1) maze_wall_right[c][r] = false;
+                    else if (dir == 3) maze_wall_right[nc][r] = false;
+                    else if (dir == 2) maze_wall_down[c][r] = false;
+                    else if (dir == 0) maze_wall_down[c][nr] = false;
+                    c = nc;
+                    r = nr;
+                }
+            }
+        }
+    };
+
+    auto reset_maze99_solver = [&]() {
+        maze99_solved = false;
+        maze99_hold_tick = 0;
+        for (int i = 0; i < 2; i++) {
+            maze99_cx[i] = 0;
+            maze99_cy[i] = 0;
+            maze99_dir[i] = 1;
+            maze99_done[i] = false;
+            maze99_pix_x[i] = maze99_target_x[i] = maze_cell_cx(0);
+            maze99_pix_y[i] = maze99_target_y[i] = maze_cell_cy(0);
+            maze99_hist_head[i] = 0;
+            for (int h = 0; h < kMaze99HistLen; h++) {
+                maze99_hist_x[i][h] = maze99_pix_x[i];
+                maze99_hist_y[i][h] = maze99_pix_y[i];
+            }
+        }
+    };
+
+    // Advances ball `i` by one step: slides it toward its current target
+    // cell, or, once there, picks the next cell by keeping its hand
+    // (maze99_hand[i]) on the wall - try the hand side first, then rotate
+    // back against the hand one step at a time until an open wall is found
+    // (at most 4 tries; a perfect maze never needs the 4th, the exact way
+    // back the ball came, except at a true dead end). Mirrors STEPB in
+    // ../maze_a99/micmz2.a99.
+    auto maze99_step_ball = [&](int i) {
+        if (maze99_done[i]) return;
+        if (maze99_pix_x[i] == maze99_target_x[i] && maze99_pix_y[i] == maze99_target_y[i]) {
+            if (maze99_cx[i] == maze_cols - 1 && maze99_cy[i] == maze_rows - 1) {
+                maze99_done[i] = true;
+                return;
+            }
+            int dir = ((maze99_dir[i] + maze99_hand[i]) % 4 + 4) % 4;
+            for (int tries = 0; tries < 4; tries++) {
+                bool open = false;
+                switch (dir) {
+                    case 0: open = maze99_cy[i] > 0 && !maze_wall_down[maze99_cx[i]][maze99_cy[i] - 1]; break;
+                    case 1: open = maze99_cx[i] < maze_cols - 1 && !maze_wall_right[maze99_cx[i]][maze99_cy[i]]; break;
+                    case 2: open = maze99_cy[i] < maze_rows - 1 && !maze_wall_down[maze99_cx[i]][maze99_cy[i]]; break;
+                    case 3: open = maze99_cx[i] > 0 && !maze_wall_right[maze99_cx[i] - 1][maze99_cy[i]]; break;
+                }
+                if (open) break;
+                dir = ((dir - maze99_hand[i]) % 4 + 4) % 4;
+            }
+            maze99_dir[i] = dir;
+            maze99_cx[i] += kMaze99Dx[dir];
+            maze99_cy[i] += kMaze99Dy[dir];
+            maze99_target_x[i] = maze_cell_cx(maze99_cx[i]);
+            maze99_target_y[i] = maze_cell_cy(maze99_cy[i]);
+            return;
+        }
+        constexpr int16_t kSpeed = 2;  // same px/frame pace as maze1-5's solver dot
+        if (maze99_pix_x[i] < maze99_target_x[i]) {
+            maze99_pix_x[i] = static_cast<int16_t>(maze99_pix_x[i] + kSpeed);
+            if (maze99_pix_x[i] > maze99_target_x[i]) maze99_pix_x[i] = maze99_target_x[i];
+        } else if (maze99_pix_x[i] > maze99_target_x[i]) {
+            maze99_pix_x[i] = static_cast<int16_t>(maze99_pix_x[i] - kSpeed);
+            if (maze99_pix_x[i] < maze99_target_x[i]) maze99_pix_x[i] = maze99_target_x[i];
+        }
+        if (maze99_pix_y[i] < maze99_target_y[i]) {
+            maze99_pix_y[i] = static_cast<int16_t>(maze99_pix_y[i] + kSpeed);
+            if (maze99_pix_y[i] > maze99_target_y[i]) maze99_pix_y[i] = maze99_target_y[i];
+        } else if (maze99_pix_y[i] > maze99_target_y[i]) {
+            maze99_pix_y[i] = static_cast<int16_t>(maze99_pix_y[i] - kSpeed);
+            if (maze99_pix_y[i] < maze99_target_y[i]) maze99_pix_y[i] = maze99_target_y[i];
+        }
+    };
+
+    // Erases ball i's previous block + tail dots, then draws them at the
+    // current position - the "tail" is 3 dots sampled from the ball's own
+    // recent-position history, each dimmer than the last, adapting the
+    // original's shrinking sprite dots (this panel has no sprites) to the
+    // fading-tail look already used elsewhere in this firmware (see
+    // hub75/ping2's comet tail).
+    auto draw_maze99_ball = [&](int i, uint8_t r, uint8_t g, uint8_t b) {
+        if (maze99_prev_ball_valid[i]) {
+            dma_display->fillRect(static_cast<int16_t>(maze99_prev_ball_x[i] - maze_cell_size / 2),
+                                   static_cast<int16_t>(maze99_prev_ball_y[i] - maze_cell_size / 2), maze_cell_size,
+                                   maze_cell_size, 0, 0, 0);
+        }
+        for (int k = 0; k < kMaze99TailCount; k++) {
+            if (maze99_prev_tail_valid[i][k]) {
+                dma_display->drawPixelRGB888(maze99_prev_tail_x[i][k], maze99_prev_tail_y[i][k], 0, 0, 0);
+            }
+        }
+        for (int k = 0; k < kMaze99TailCount; k++) {
+            const int back = (k + 1) * kMaze99TailStepFrames;
+            const int idx = ((maze99_hist_head[i] - back) % kMaze99HistLen + kMaze99HistLen) % kMaze99HistLen;
+            const int16_t tx = maze99_hist_x[i][idx], ty = maze99_hist_y[i][idx];
+            const uint8_t fade = static_cast<uint8_t>(190 - k * 55);  // each dot dimmer than the last
+            dma_display->drawPixelRGB888(tx, ty, static_cast<uint8_t>(r * fade / 255), static_cast<uint8_t>(g * fade / 255),
+                                          static_cast<uint8_t>(b * fade / 255));
+            maze99_prev_tail_x[i][k] = tx;
+            maze99_prev_tail_y[i][k] = ty;
+            maze99_prev_tail_valid[i][k] = true;
+        }
+        dma_display->fillRect(static_cast<int16_t>(maze99_pix_x[i] - maze_cell_size / 2),
+                               static_cast<int16_t>(maze99_pix_y[i] - maze_cell_size / 2), maze_cell_size, maze_cell_size,
+                               r, g, b);
+        maze99_prev_ball_x[i] = maze99_pix_x[i];
+        maze99_prev_ball_y[i] = maze99_pix_y[i];
+        maze99_prev_ball_valid[i] = true;
+    };
+
+    auto run_maze99_frame = [&]() {
+        if (!maze99_solved) {
+            maze99_step_ball(0);
+            maze99_step_ball(1);
+            for (int i = 0; i < 2; i++) {
+                maze99_hist_head[i] = (maze99_hist_head[i] + 1) % kMaze99HistLen;
+                maze99_hist_x[i][maze99_hist_head[i]] = maze99_pix_x[i];
+                maze99_hist_y[i][maze99_hist_head[i]] = maze99_pix_y[i];
+            }
+            if (maze99_done[0] || maze99_done[1]) {
+                maze99_solved = true;
+                maze99_hold_tick = 0;
+                if (maze99_done[0] && maze99_done[1]) maze99_ties++;
+                else if (maze99_done[0]) maze99_wins[0]++;
+                else maze99_wins[1]++;
+                ESP_LOGI(TAG, "maze99: %s (score R%d T%d B%d)",
+                         (maze99_done[0] && maze99_done[1]) ? "tie" : (maze99_done[0] ? "red wins" : "blue wins"),
+                         maze99_wins[0], maze99_ties, maze99_wins[1]);
+            }
+        } else if (++maze99_hold_tick >= kMaze99HoldTicks) {
+            generate_maze99();
+            reset_maze99_solver();
+        }
+        draw_maze_walls();
+        draw_maze99_ball(0, 255, 0, 0);
+        draw_maze99_ball(1, 40, 140, 255);
+        if (maze99_solved) {
+            char score[16];
+            snprintf(score, sizeof(score), "r%d t%d b%d", maze99_wins[0], maze99_ties, maze99_wins[1]);
+            draw_text_small(static_cast<int16_t>((PANEL_WIDTH - small_text_width(score)) / 2), 1, score, 255, 255, 255);
+        }
+    };
+
     // hub75/ping2: comet flight/impact animation, entirely advanced here
     // one frame at a time - ping2_task() (a separate background task) only
     // ever sets the ping2_launch_* trigger above; everything about how it
@@ -4067,6 +4612,7 @@ extern "C" void app_main(void)
     // the panel flicker, so they're only redrawn when this key changes.
     uint32_t last_static_key = 0xFFFFFFFFu;
     DisplayMode prev_frame_mode = DisplayMode::kWifiStatus;
+    bool ntp_blink_was_active = false;
 
 
     // Reset-reason banner: "RR=<n>" briefly, before the owner-info splash
@@ -4081,6 +4627,13 @@ extern "C" void app_main(void)
     snprintf(rr_banner_text, sizeof(rr_banner_text), "RR=%d", static_cast<int>(esp_reset_reason()));
     const int64_t rr_banner_end_us = esp_timer_get_time() + kRrBannerMs * 1000;
     bool rr_banner_drawn = false;
+
+    // Firmware version (PROJECT_VER), white on black, for kVersionMs right
+    // after the RR banner - so which build is running is visible on the
+    // panel itself.
+    constexpr int64_t kVersionMs = 5000;
+    const int64_t version_end_us = rr_banner_end_us + kVersionMs * 1000;
+    bool version_drawn = false;
 
     // Boot splash: up to 4 lines of text from CONFIG_SPLASH_LINE1..4 (menuconfig
     // "HD-WF1 Boot Splash"; the real values live in the gitignored sdkconfig),
@@ -4098,7 +4651,7 @@ extern "C" void app_main(void)
         if (line[0] != '\0') splash_lines[kSplashLineCount++] = line;
     }
     constexpr int16_t kSplashLinePitch = 9;  // 5px glyph + 4px gap
-    const int64_t splash_end_us = esp_timer_get_time() + kSplashMs * 1000;
+    const int64_t splash_end_us = esp_timer_get_time() + (kRrBannerMs + 5000 + kSplashMs) * 1000;
     bool splash_over = (kSplashLineCount == 0);
     int splash_drawn_state = -1;  // -1 nothing drawn yet, 0 text only, 1 text + green pixel
 
@@ -4130,8 +4683,14 @@ extern "C" void app_main(void)
         const uint8_t wanted_brightness = target_brightness;
         const bool wanted_blink = blink_enabled;
         const bool local_ntp_synced = ntp_synced;
+        const int64_t local_ntp_blink_end_us = ntp_blink_end_us;
         const ClockTz local_clock_tz = clock_tz;
         const uint8_t local_clock_r = clock_color_r, local_clock_g = clock_color_g, local_clock_b = clock_color_b;
+        const bool local_clock_chilanka = clock_chilanka;
+        uint8_t local_clock_fg[3], local_clock_bg[3], local_clock_hue[3];
+        memcpy(local_clock_fg, clock_fg, 3);
+        memcpy(local_clock_bg, clock_bg, 3);
+        memcpy(local_clock_hue, clock_hue, 3);
         if (mode != DisplayMode::kClockConfirm) clock_confirm_tick = 0;
         if (mode != DisplayMode::kPong) {
             pong_left_score = 0;
@@ -4182,10 +4741,20 @@ extern "C" void app_main(void)
                 maze_variant_narrow = want_narrow;
             }
             maze_primed = false;  // will need a fresh maze prepped once this mode is left
+            maze99_primed = false;  // ... and so does maze99, if it's entered next
+        } else if (mode == DisplayMode::kMaze99) {
+            if (!maze99_primed) {
+                configure_maze(false);  // 3px paths, like maze1 - room for a filled-cell ball plus its tail
+                generate_maze99();
+                reset_maze99_solver();
+                maze99_primed = true;
+            }
+            maze_primed = false;  // leaving maze1-5's family needs a fresh maze prepped once it's re-entered
         } else if (!maze_primed) {
             generate_maze();
             reset_maze_solver();
             maze_primed = true;
+            maze99_primed = false;
         }
         uint16_t local_ping1_graph_ms[kPing1GraphWidth];
         memcpy(local_ping1_graph_ms, ping1_graph_ms, sizeof(local_ping1_graph_ms));
@@ -4263,7 +4832,13 @@ extern "C" void app_main(void)
         }
 
         if (wanted_brightness != applied_brightness) {
-            applied_brightness = wanted_brightness;
+            // Ramp up gradually (a sudden dim->bright step is a big load transient); go down at once.
+            if (wanted_brightness > applied_brightness) {
+                const int next = applied_brightness + kBrightnessRampStep;
+                applied_brightness = static_cast<uint8_t>(next < wanted_brightness ? next : wanted_brightness);
+            } else {
+                applied_brightness = wanted_brightness;
+            }
             dma_display->setBrightness8(applied_brightness);
         }
 
@@ -4274,6 +4849,18 @@ extern "C" void app_main(void)
                 draw_text_small(static_cast<int16_t>((PANEL_WIDTH - small_text_width(rr_banner_text)) / 2),
                                  static_cast<int16_t>((PANEL_HEIGHT - kSmallFontHeight) / 2), rr_banner_text, 255,
                                  255, 255);
+            }
+            vTaskDelay(pdMS_TO_TICKS(30));
+            continue;
+        }
+
+        if (esp_timer_get_time() < version_end_us) {
+            if (!version_drawn) {
+                version_drawn = true;
+                const char *ver = esp_app_get_description()->version;
+                dma_display->clearScreen();
+                draw_text_small(static_cast<int16_t>((PANEL_WIDTH - small_text_width(ver)) / 2),
+                                static_cast<int16_t>((PANEL_HEIGHT - kSmallFontHeight) / 2), ver, 255, 255, 255);
             }
             vTaskDelay(pdMS_TO_TICKS(30));
             continue;
@@ -4302,6 +4889,28 @@ extern "C" void app_main(void)
             last_static_key = 0xFFFFFFFFu;
             prev_frame_mode = static_cast<DisplayMode>(-1);
         }
+
+        // Successful NTP sync: blink the lower-right pixel green (4 Hz-ish, ~4s). Drawn over whatever is on
+        // screen, so once it ends everything is repainted from scratch to restore the pixel it overwrote.
+        const int64_t now_us = esp_timer_get_time();
+        const bool ntp_blink_active = now_us < local_ntp_blink_end_us;
+        const bool ntp_blink_on = ntp_blink_active && ((now_us / 250000) % 2 == 0);
+        if (ntp_blink_was_active && !ntp_blink_active) {
+            last_static_key = 0xFFFFFFFFu;
+            prev_frame_mode = static_cast<DisplayMode>(-1);
+        }
+        ntp_blink_was_active = ntp_blink_active;
+        auto draw_corner_overlay = [&]() -> bool {  // gateway-ping sequence wins over the NTP blink
+            if (gateway_ping_active) {
+                dma_display->drawPixelRGB888(PANEL_WIDTH - 1, PANEL_HEIGHT - 1, 0, gateway_ping_pixel_on ? 255 : 0, 0);
+                return true;
+            }
+            if (ntp_blink_active) {
+                dma_display->drawPixelRGB888(PANEL_WIDTH - 1, PANEL_HEIGHT - 1, 0, ntp_blink_on ? 255 : 0, 0);
+                return true;
+            }
+            return false;
+        };
 
         {
             const bool static_mode =
@@ -4339,11 +4948,7 @@ extern "C" void app_main(void)
                     // flipDMABuffer() below) even though the rest of the
                     // frame is being skipped as unchanged - otherwise a
                     // long-press during a static mode would never blink.
-                    if (gateway_ping_active) {
-                        dma_display->drawPixelRGB888(PANEL_WIDTH - 1, PANEL_HEIGHT - 1, 0,
-                                                      gateway_ping_pixel_on ? 255 : 0, 0);
-                        dma_display->flipDMABuffer();
-                    }
+                    if (draw_corner_overlay()) dma_display->flipDMABuffer();
                     vTaskDelay(pdMS_TO_TICKS(30));
                     continue;  // already on screen, unchanged
                 }
@@ -4359,7 +4964,8 @@ extern "C" void app_main(void)
         prev_frame_mode = mode;
         const bool skip_clear = !wanted_blink && !mode_changed &&
                                 (mode == DisplayMode::kMaze1 || mode == DisplayMode::kMaze2 ||
-                                 mode == DisplayMode::kMaze3);
+                                 mode == DisplayMode::kMaze3 || mode == DisplayMode::kMaze99 ||
+                                 mode == DisplayMode::kClock);
         if (!skip_clear) {
             // kMessage clears to its configurable background (CONFIG_DEFAULT_TEXT_BG,
             // 'HD-WF1 Default Text') instead of the fixed black every other mode uses.
@@ -4585,6 +5191,10 @@ extern "C" void app_main(void)
                 run_maze_frame();
                 break;
 
+            case DisplayMode::kMaze99:
+                run_maze99_frame();
+                break;
+
             case DisplayMode::kPing1: {
                 // Scrolling latency strip-chart: one column per sample
                 // (oldest at x=0, newest at the right edge), bar height and
@@ -4685,7 +5295,8 @@ extern "C" void app_main(void)
                 break;
 
             case DisplayMode::kClock:
-                run_clock_frame(local_ntp_synced, local_clock_tz, local_clock_r, local_clock_g, local_clock_b);
+                run_clock_frame(local_ntp_synced, local_clock_tz, local_clock_r, local_clock_g, local_clock_b, !skip_clear,
+                                local_clock_chilanka, local_clock_fg, local_clock_bg, local_clock_hue);
                 break;
 
             case DisplayMode::kClockConfirm: {
@@ -4760,9 +5371,7 @@ extern "C" void app_main(void)
         // sequence is running - unlike the static/maze/mode-drawing paths
         // above, this can't rely on redrawing only on change, since it must
         // win over modes that clear + redraw the whole panel every frame.
-        if (gateway_ping_active) {
-            dma_display->drawPixelRGB888(PANEL_WIDTH - 1, PANEL_HEIGHT - 1, 0, gateway_ping_pixel_on ? 255 : 0, 0);
-        }
+        draw_corner_overlay();
 
         dma_display->flipDMABuffer();
         vTaskDelay(pdMS_TO_TICKS(30));

@@ -288,6 +288,23 @@ menu "HD-WF1 Ping"
 
 endmenu
 
+menu "HD-WF1 Power"
+
+    config MAX_BRIGHTNESS
+        int "Maximum panel brightness (1-255) used by hub75/bright"
+        range 1 255
+        default 128
+        help
+            hub75/bright sets the panel to this brightness (hub75/dim stays at 32).
+            A full-panel solid color at 255 draws the most current a 128x64
+            panel can, and on an undersized 5V supply that browns out the
+            ESP32 (boot banner "RR=9", ESP_RST_BROWNOUT). Lower this until
+            the supply holds; raise it once the panel has a proper 5V feed.
+            Brightness changes are also ramped up gradually rather than
+            stepped, to avoid an inrush spike.
+
+endmenu
+
 menu "HD-WF1 NTP"
 
     config NTP_SERVER1
