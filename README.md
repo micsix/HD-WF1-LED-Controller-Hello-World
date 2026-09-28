@@ -262,10 +262,10 @@ lowercase hex digits, e.g. `aabbccddeeff`:
 |---|---|---|
 | `POST /api/<mac>/command/<name>` (or `PUT`) | the MQTT payload (empty for "any" topics) | Runs the command for topic `hub75/<name>`. |
 | `GET /api/<mac>/status` | – | Current state as JSON. |
-| `POST /api/<mac>/save` | – | Persists what the panel is showing (last content command + dim/bright) to flash; it is replayed on every boot, before WiFi is up. `409` if nothing has been shown yet. |
+| `POST /api/<mac>/save` | – | Persists what the panel is showing (last content command + brightness) to flash; it is replayed on every boot, before WiFi is up. `409` if nothing has been shown yet. |
 | `POST /api/<mac>/unsave` | – | Forgets the saved display; boot behaves as before. |
 | `GET /api/whoami` | – | Fixed, unauthenticated path for LAN discovery: `{"device":"hd-wf1-hub75","device_id":"<mac>","auth":false}`. |
-| `GET /api/<mac>/info` | – | Static facts as JSON: `{"device_id":"...","width":128,"height":64,"full_effects":false,"version":"v2026.09.26.016"}`. |
+| `GET /api/<mac>/info` | – | Static facts as JSON: `{"device_id":"...","width":128,"height":64,"full_effects":false,"version":"v2026.09.27.021"}`. |
 
 Disable that setting for the legacy flat `/api/command/<name>` and
 `/api/status` paths (fine for a single board, or behind a reverse proxy that
@@ -323,7 +323,7 @@ router's client list.
 
 > **Lean build (default):** to save heap on the 128×64 panel only these are
 > subscribed: `message`, `1300`/`1300a`-`f`/`1300L`/`1300LI`/`nn`-`nnnnnn`[`L`] (numbers)/`13`/`00`, the solid colours,
-> `off`, `dim`/`bright`, `flash`/`noflash`, `shootingstars`, `time`, `maze1`-`3`, `maze99`,
+> `off`, `dim`/`bright`/`brightness`, `flash`/`noflash`, `shootingstars`, `time`, `maze1`-`3`, `maze99`,
 > and the clock/`ntpset` topics. Everything else below (games, matrix,
 > elevator, auto-test, ping effects, `maze4`/`maze5`) is still in
 > the source but not subscribed, and the ping/`maze4` tasks aren't started. Set
@@ -364,8 +364,9 @@ router's client list.
 | `hub75/maze99` | any | Ported from the TI-99/4A assembly original (`../maze_a99/micmz2.a99`): a random perfect maze built with **Wilson's algorithm** (every possible maze equally likely, unlike `maze1`-`5`'s randomized-DFS carve) raced by two balls at `maze1`'s 3px path width - red keeping its right hand on the wall, blue its left - each dragging a fading 3-dot tail. The first to reach the bottom-right cell wins the round at once (both arriving on the same tick is a tie); a running red/tie/blue tally is kept for as long as this mode stays active and shown briefly (~1.8s) between rounds before the next maze is carved. Unlike the original, there is no "preparing next maze" progress screen - carving this size of maze is instant on the ESP32. |
 | `hub75/ping1` | any | A scrolling network-latency strip-chart: roughly every ~250ms+RTT, pings one target picked at random from the configured list (see 'HD-WF1 Ping' in menuconfig - up to 8 targets, default just `192.168.92.1`) and scrolls a new bar in from the right (like a ping/oscilloscope graph). Bar height and color both encode the delay - green (fast) through yellow/orange to red (slow), with a full-height red bar marking a timed-out ping (or DNS failure, or - in TCP mode - a refused/closed port; 500ms timeout). The display itself always animates smoothly regardless of network speed, since only the background sampling waits on the network. The true measured delay is also shown numerically as a real number in ms, one decimal place (small fixed-width font, white, microsecond-resolution timing), centered on a reserved strip below the graph - flanked by the running successful-reply count (left-justified, green) and timed-out-reply count (right-justified, red), both reset to 0 each time the mode is (re)entered. |
 | `hub75/ping2` | any | A "comet" launch/impact animation: each ping (to the same randomly-picked, configurable target list as `hub75/ping1`) launches a bright white-hot comet (with a 6px fading tail) that streaks left-to-right across the panel. Flight *speed* encodes the latency - a fast reply darts across in a few frames, a slow one crawls - so the effect gets visibly more dramatic as the network struggles. A successful ping ends in a flash + expanding 8-point spark-burst explosion at the target; a timed-out ping instead peters out 60% of the way there in a dim, slow 5-point fizzle, visually distinguishing "it arrived" from "it never showed up." Same numeric ms readout convention as `hub75/ping1`, in a reserved strip below the animation. |
-| `hub75/dim` | any | Sets panel brightness to ~50%. |
+| `hub75/dim` | any | Sets panel brightness to a fixed ~12.5% (32/255). |
 | `hub75/bright` | any | Sets panel brightness to the *HD-WF1 Power → Maximum panel brightness* cap (default 128/255; 255 = 100%), ramped up over ~1s. The cap exists because full-brightness solid colors can brown out an undersized 5V supply (`RR=9`). |
+| `hub75/brightness` | optional JSON `{"percent":0-100}` | Sets panel brightness to any level in between, as a percentage of the same capped maximum `hub75/bright` uses (so 100 here equals `hub75/bright`, not necessarily 255/255) - e.g. `{"percent":25}` for a quarter of that cap. Missing/invalid payload or an out-of-range percent falls back to 100. Also ramped up over ~1s, same as `hub75/bright`. |
 | `hub75/red` `hub75/green` `hub75/blue` `hub75/yellow` `hub75/orange` `hub75/white` `hub75/black` | any | Fills the whole panel with that solid color. |
 | `hub75/flash` | any | Toggles blinking whatever's currently on screen: 3s on / 2s off, repeating. Each publish flips it on/off. |
 | `hub75/noflash` | any | Forces blinking off, regardless of current state. |

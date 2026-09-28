@@ -1001,6 +1001,7 @@ constexpr const char *kTest3Topic = "hub75/test3";
 // target_brightness. Payload is ignored, same as the test topics.
 constexpr const char *kDimTopic = "hub75/dim";
 constexpr const char *kBrightTopic = "hub75/bright";
+constexpr const char *kBrightnessTopic = "hub75/brightness";  // {"percent":0-100}, any arbitrary level
 // setBrightnessOE() scales the OE-enable window linearly with this value, but
 // perceived brightness is compressive (roughly a cube-root law), so a linear
 // 50% (128) barely reads as dimmer to the eye - dropping much lower makes
@@ -1292,6 +1293,30 @@ void set_brightness(uint8_t brightness) {
   ESP_LOGI(MQTT_TAG, "brightness set to %d/255", brightness);
 }
 
+// hub75/brightness: {"percent":0-100} for any level in between hub75/dim (a fixed ~12.5%) and hub75/bright
+// (the menuconfig-capped level) - e.g. {"percent":25} for a quarter brightness. Missing/invalid payload or an
+// out-of-range percent falls back to 100 (full, subject to the same CONFIG_MAX_BRIGHTNESS cap as hub75/bright -
+// see 'HD-WF1 Power' menuconfig and set_brightness()'s comment on why that cap exists).
+void set_brightness_percent(const char *data, int data_len) {
+  int percent = 100;
+  if (data != nullptr && data_len > 0) {
+    cJSON *root = cJSON_ParseWithLength(data, data_len);
+    if (root != nullptr) {
+      const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, "percent");
+      if (cJSON_IsNumber(item) && item->valuedouble >= 0 && item->valuedouble <= 100) {
+        percent = static_cast<int>(item->valuedouble);
+      } else {
+        ESP_LOGW(MQTT_TAG, "brightness: invalid \"percent\" (want 0-100), using 100");
+      }
+      cJSON_Delete(root);
+    } else {
+      ESP_LOGW(MQTT_TAG, "brightness: payload is not valid JSON, using 100");
+    }
+  }
+  const uint8_t capped = percent > 100 ? kFullBrightness : static_cast<uint8_t>(percent * kFullBrightness / 100);
+  set_brightness(capped);
+}
+
 void set_solid_color(uint8_t r, uint8_t g, uint8_t b, const char *name) {
   xSemaphoreTake(display_mutex, portMAX_DELAY);
   solid_r = r;
@@ -1352,6 +1377,8 @@ bool dispatch_command_impl(const char *topic, int topic_len, const char *data, i
     set_brightness(kDimBrightness);
   } else if (topic_matches(topic, topic_len, kBrightTopic)) {
     set_brightness(kFullBrightness);
+  } else if (topic_matches(topic, topic_len, kBrightnessTopic)) {
+    set_brightness_percent(data, data_len);
   } else if (topic_matches(topic, topic_len, kRedTopic)) {
     set_solid_color(255, 0, 0, "red");
   } else if (topic_matches(topic, topic_len, kGreenTopic)) {
@@ -1502,18 +1529,23 @@ constexpr const char *kSaveNs = "hub75_saved";
 char last_content_topic[64] = "";
 char last_content_body[512] = "";
 char last_brightness_topic[24] = "";
+char last_brightness_body[40] = "";
 portMUX_TYPE last_cmd_mux = portMUX_INITIALIZER_UNLOCKED;
 
 bool dispatch_command(const char *topic, int topic_len, const char *data, int data_len) {
   if (!dispatch_command_impl(topic, topic_len, data, data_len)) return false;
   if (topic_len <= 0 || topic_len >= static_cast<int>(sizeof(last_content_topic))) return true;
-  const bool is_bright = topic_matches(topic, topic_len, kDimTopic) || topic_matches(topic, topic_len, kBrightTopic);
+  const bool is_bright = topic_matches(topic, topic_len, kDimTopic) || topic_matches(topic, topic_len, kBrightTopic) ||
+                         topic_matches(topic, topic_len, kBrightnessTopic);
   const bool is_modifier = topic_matches(topic, topic_len, kFlashTopic) || topic_matches(topic, topic_len, kNoFlashTopic) ||
                            topic_matches(topic, topic_len, kNtpSetTopic);
   if (is_modifier) return true;
   taskENTER_CRITICAL(&last_cmd_mux);
   if (is_bright) {
     snprintf(last_brightness_topic, sizeof(last_brightness_topic), "%.*s", topic_len, topic);
+    const int bn = (data != nullptr && data_len > 0) ? (data_len < 39 ? data_len : 39) : 0;
+    if (bn > 0) memcpy(last_brightness_body, data, bn);
+    last_brightness_body[bn] = '\0';
   } else {
     snprintf(last_content_topic, sizeof(last_content_topic), "%.*s", topic_len, topic);
     const int n = (data != nullptr && data_len > 0) ? (data_len < 511 ? data_len : 511) : 0;
@@ -1535,11 +1567,13 @@ esp_err_t saved_display_nvs_init() {
 
 // Returns ESP_ERR_INVALID_STATE if nothing has been shown yet.
 esp_err_t save_current_display(char *saved_topic, size_t saved_topic_len) {
-  char topic[sizeof(last_content_topic)], body[sizeof(last_content_body)], bright[sizeof(last_brightness_topic)];
+  char topic[sizeof(last_content_topic)], body[sizeof(last_content_body)], bright[sizeof(last_brightness_topic)],
+      bright_body[sizeof(last_brightness_body)];
   taskENTER_CRITICAL(&last_cmd_mux);
   memcpy(topic, last_content_topic, sizeof(topic));
   memcpy(body, last_content_body, sizeof(body));
   memcpy(bright, last_brightness_topic, sizeof(bright));
+  memcpy(bright_body, last_brightness_body, sizeof(bright_body));
   taskEXIT_CRITICAL(&last_cmd_mux);
   if (topic[0] == '\0') return ESP_ERR_INVALID_STATE;
   nvs_handle_t h;
@@ -1548,6 +1582,7 @@ esp_err_t save_current_display(char *saved_topic, size_t saved_topic_len) {
   err = nvs_set_str(h, "topic", topic);
   if (err == ESP_OK) err = nvs_set_str(h, "body", body);
   if (err == ESP_OK) err = nvs_set_str(h, "bright", bright);
+  if (err == ESP_OK) err = nvs_set_str(h, "bright_body", bright_body);
   if (err == ESP_OK) err = nvs_commit(h);
   nvs_close(h);
   if (err == ESP_OK) strlcpy(saved_topic, topic, saved_topic_len);
@@ -1568,17 +1603,20 @@ void restore_saved_display() {
   if (saved_display_nvs_init() != ESP_OK) return;
   nvs_handle_t h;
   if (nvs_open(kSaveNs, NVS_READONLY, &h) != ESP_OK) return;
-  char topic[sizeof(last_content_topic)] = "", body[sizeof(last_content_body)] = "", bright[sizeof(last_brightness_topic)] = "";
+  char topic[sizeof(last_content_topic)] = "", body[sizeof(last_content_body)] = "", bright[sizeof(last_brightness_topic)] = "",
+      bright_body[sizeof(last_brightness_body)] = "";
   size_t n = sizeof(topic);
   const bool have = nvs_get_str(h, "topic", topic, &n) == ESP_OK && topic[0] != '\0';
   n = sizeof(body);
   nvs_get_str(h, "body", body, &n);
   n = sizeof(bright);
   nvs_get_str(h, "bright", bright, &n);
+  n = sizeof(bright_body);
+  nvs_get_str(h, "bright_body", bright_body, &n);
   nvs_close(h);
   if (!have) return;
   ESP_LOGI(TAG, "restoring saved display: %s (brightness: %s)", topic, bright[0] ? bright : "default");
-  if (bright[0]) dispatch_command(bright, static_cast<int>(strlen(bright)), "", 0);
+  if (bright[0]) dispatch_command(bright, static_cast<int>(strlen(bright)), bright_body, static_cast<int>(strlen(bright_body)));
   dispatch_command(topic, static_cast<int>(strlen(topic)), body, static_cast<int>(strlen(body)));
 }
 
@@ -4476,11 +4514,8 @@ extern "C" void app_main(void)
         draw_maze_walls();
         draw_maze99_ball(0, 255, 0, 0);
         draw_maze99_ball(1, 40, 140, 255);
-        if (maze99_solved) {
-            char score[16];
-            snprintf(score, sizeof(score), "r%d t%d b%d", maze99_wins[0], maze99_ties, maze99_wins[1]);
-            draw_text_small(static_cast<int16_t>((PANEL_WIDTH - small_text_width(score)) / 2), 1, score, 255, 255, 255);
-        }
+        // The red/tie/blue tally is still logged above for the applog; it's not shown on screen - it read
+        // barely legibly at this font size and wasn't worth the screen space.
     };
 
     // hub75/ping2: comet flight/impact animation, entirely advanced here
@@ -4602,9 +4637,10 @@ extern "C" void app_main(void)
 
     uint8_t applied_brightness = kDimBrightness;  // matches the initial dma_display->setBrightness8() above
 
-    // hub75/flash: blink whatever the current mode draws, 3s on / 2s off.
-    constexpr int kBlinkOnTicks = 100;   // 100 * 30ms = 3.0s
-    constexpr int kBlinkOffTicks = 67;   // 67 * 30ms ~= 2.0s
+    // hub75/flash: blink whatever the current mode draws, at the rate of a flashing red traffic signal (MUTCD
+    // spec: 50-60 flashes/minute, 50% duty) rather than the old 3s-on/2s-off cycle, which read as erratic.
+    constexpr int kBlinkOnTicks = 18;    // 18 * 30ms = 0.54s
+    constexpr int kBlinkOffTicks = 18;   // 18 * 30ms = 0.54s -> 1.08s/cycle, ~56 flashes/min
     constexpr int kBlinkPeriodTicks = kBlinkOnTicks + kBlinkOffTicks;
     int blink_tick = 0;
     // Static screens (solid colours, hub75/1300*, off) don't change frame to
@@ -4912,9 +4948,24 @@ extern "C" void app_main(void)
             return false;
         };
 
+        // Computed here (before the static-mode skip-redraw check below) rather than where it's used for
+        // drawing, so a static mode's "unchanged, skip the redraw" key can include it: previously blink
+        // forced every static mode to fully clear+redraw on EVERY tick regardless of whether blink_visible
+        // had actually changed since the last tick, which flickered visibly on this single-buffered panel
+        // (clearing briefly blanks the buffer the DMA engine is actively scanning out). Folding blink_visible
+        // into the key means a run of ticks with the same on/off phase is treated as unchanged - only the
+        // two transitions each cycle (on->off, off->on) actually clear+redraw.
+        bool blink_visible = true;
+        if (wanted_blink) {
+            blink_visible = (blink_tick % kBlinkPeriodTicks) < kBlinkOnTicks;
+            blink_tick++;
+        } else {
+            blink_tick = 0;
+        }
+
         {
             const bool static_mode =
-                    !wanted_blink && (mode == DisplayMode::kSolidColor || mode == DisplayMode::kOff ||
+                    (mode == DisplayMode::kSolidColor || mode == DisplayMode::kOff ||
                                       mode == DisplayMode::kFixed1300 || mode == DisplayMode::kFixed1300Alt ||
                                       mode == DisplayMode::kFixed1300B || mode == DisplayMode::kFixed1300C ||
                                       mode == DisplayMode::kFixed1300D || mode == DisplayMode::kFixed1300E ||
@@ -4927,6 +4978,7 @@ extern "C" void app_main(void)
                 key ^= (static_cast<uint32_t>(local_solid_r) << 16) | (static_cast<uint32_t>(local_solid_g) << 8) |
                        static_cast<uint32_t>(local_solid_b);
                 key ^= static_cast<uint32_t>(applied_brightness) << 24;
+                key ^= blink_visible ? 0xA5A5A5A5u : 0x5A5A5A5Au;
                 if (mode == DisplayMode::kNumberL) {  // digits + colours from the payload
                     for (const char *c = local_number_digits; *c; c++) key = key * 16777619u ^ static_cast<uint8_t>(*c);
                     for (int i = 0; i < 3; i++)
@@ -4974,14 +5026,6 @@ extern "C" void app_main(void)
             } else {
                 dma_display->clearScreen();
             }
-        }
-
-        bool blink_visible = true;
-        if (wanted_blink) {
-            blink_visible = (blink_tick % kBlinkPeriodTicks) < kBlinkOnTicks;
-            blink_tick++;
-        } else {
-            blink_tick = 0;
         }
 
         // hub75/1300's geometry depends on the live panel size (see
