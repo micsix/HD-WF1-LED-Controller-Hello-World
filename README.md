@@ -285,8 +285,8 @@ lowercase hex digits, e.g. `aabbccddeeff`:
 | `GET /api/<mac>/status` | – | Current state as JSON. |
 | `POST /api/<mac>/save` | – | Persists what the panel is showing (last content command + brightness) to flash; it is replayed on every boot, before WiFi is up. `409` if nothing has been shown yet. |
 | `POST /api/<mac>/unsave` | – | Forgets the saved display; boot behaves as before. |
-| `GET /api/whoami` | – | Fixed, unauthenticated path for LAN discovery: `{"device":"hd-wf1-hub75","device_id":"<mac>","auth":false}`. |
-| `GET /api/<mac>/info` | – | Static facts as JSON: `{"device_id":"...","width":128,"height":64,"full_effects":false,"version":"v2026.09.30.022"}`. |
+| `GET /api/whoami` | – | Fixed, unauthenticated path for LAN discovery: `{"device":"hd-wf1-hub75","device_id":"<mac>","auth":false}` - plus `"https_port"`/`"tls_fingerprint"` on an HTTPS-enabled build (hd-wf2 branch only, see [HTTPS](#https-hd-wf2-branch-only) below). |
+| `GET /api/<mac>/info` | – | Static facts as JSON: `{"device_id":"...","width":128,"height":64,"full_effects":false,"version":"v2026.09.30.023"}`. |
 
 Disable that setting for the legacy flat `/api/command/<name>` and
 `/api/status` paths (fine for a single board, or behind a reverse proxy that
@@ -319,7 +319,53 @@ checking that a command took effect.
 **Security:** with the token left empty (the default) anyone on the network
 can control the panel. Set *REST API bearer token* in menuconfig and send
 `-H "Authorization: Bearer <token>"`. Traffic is plain HTTP, so treat the token
-as LAN-grade protection only.
+as LAN-grade protection only - or, on the hd-wf2 branch, use HTTPS instead so
+it isn't sent in the clear at all; see below.
+
+#### HTTPS (hd-wf2 branch only)
+
+An optional second server, identical to the plain one above but TLS-wrapped,
+on *HD-WF1 HTTPS API → HTTPS REST API port* (default 443) - see
+[HD-WF2 (ESP32-S3) bring-up notes](#hd-wf2-esp32-s3-bring-up-notes) for why
+this isn't offered on the HD-WF1/esp32s2 branch (each TLS connection costs
+~40KB of heap, which that board doesn't have to spare). The plain HTTP
+server keeps running unchanged on its own port - nothing is forced to
+switch over.
+
+1. **Generate a certificate first** (not committed - each board gets its
+   own, like its WiFi password): `tools/gen_https_cert.sh`. Writes
+   `certs/server_cert.pem`/`server_key.pem` (ECDSA prime256v1, self-signed,
+   10-year validity).
+2. **Enable it**: `idf.py menuconfig` → *HD-WF1 HTTPS API* → *Enable HTTPS
+   on the REST API*. The build fails with a clear message if the cert/key
+   from step 1 don't exist yet.
+3. **Pin the certificate, don't rely on CA/hostname validation** - this is
+   a LAN device with a DHCP-assigned IP and no real DNS name, so standard
+   validation doesn't apply (and will visibly fail: `curl --cacert
+   server_cert.pem` against the board's IP correctly rejects it with
+   "certificate subject name ... does not match target host name", since
+   the cert's CN is cosmetic, not a hostname promise). Instead, fetch
+   the certificate's SHA-256 fingerprint from the unauthenticated,
+   plain-HTTP `/api/whoami` endpoint's `"tls_fingerprint"` field *before*
+   ever connecting over HTTPS, remember it, and compare it against the
+   live certificate on every subsequent HTTPS connection (trust-on-first-
+   use, the same model SSH host keys and apps like Home Assistant use for
+   self-signed local devices). Both Android apps in this project do this.
+   `openssl x509 -in certs/server_cert.pem -noout -fingerprint -sha256`
+   (colons and case stripped) computes the same value locally, to confirm
+   you're pinning the right one.
+
+```sh
+# first, over plain HTTP, learn the fingerprint to pin:
+curl http://<device-ip>/api/whoami
+# {"device":"hd-wf1-hub75","device_id":"aabbccddeeff","auth":false,"https_port":443,
+#  "tls_fingerprint":"24dc1a480e0c02fd4699df29ddff36d99f578f63582e01c30c7c7fdec99881f9"}
+
+# then, once that fingerprint is pinned client-side, use HTTPS (here -k skips
+# curl's own hostname/CA check, since this project's clients pin the
+# fingerprint themselves instead - see point 3 above):
+curl -k -X POST https://<device-ip>:443/api/aabbccddeeff/command/red
+```
 
 ### MQTT topics
 
@@ -614,6 +660,21 @@ unchanged and works identically on both.
   `#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 0, 0)` branch alongside the
   existing ones, so older-IDF builds of this same vendored file are
   unaffected.
+- **HTTPS REST API** (see [REST API → HTTPS](#https-hd-wf2-branch-only)
+  above) is this branch's one *intentional* divergence from the HD-WF1's
+  feature set, not a porting workaround - the extra ~40KB-per-connection
+  heap cost of TLS is exactly the kind of thing the HD-WF1's tens-of-KB
+  budget couldn't absorb (see the WiFi-buffer-trimming and lean-build notes
+  above), while this board's hundreds of KB make it a non-issue. Verified
+  on hardware: heap stayed flat (~190KB free, ~181KB min) across repeated
+  HTTPS requests - no per-connection leak.
+- **ESP-IDF v6's mbedTLS is 4.x**, which moved single-algorithm APIs like
+  `mbedtls_sha256()` out of the public headers (`mbedtls/sha256.h` is now
+  under a `private/` include path) in favor of the PSA Crypto API -
+  `psa_hash_compute()` instead, used here to fingerprint the HTTPS
+  certificate (see above). No separate init call needed:
+  `psa_crypto_init()` already runs automatically at boot, during
+  `esp_system`'s SECONDARY init stage.
 
 ## Root cause history
 

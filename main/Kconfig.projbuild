@@ -103,6 +103,37 @@ menu "HD-WF1 REST API"
 
 endmenu
 
+menu "HD-WF1 HTTPS API"
+
+    config HTTPS_API_ENABLE
+        bool "Enable HTTPS on the REST API (hd-wf2/ESP32-S3 only)"
+        default n
+        depends on HTTP_API_ENABLE
+        help
+            Starts a second HTTP server, identical to the plain one above,
+            on CONFIG_HTTPS_API_PORT with TLS - so the bearer token and
+            command bodies aren't sent in plaintext. Each TLS connection
+            costs ~40KB of heap (mbedTLS session + socket buffers), which
+            the ESP32-S2 (HD-WF1, tens of KB of free heap total) can't
+            spare - this is offered only on the hd-wf2 branch, built for
+            the ESP32-S3's much larger heap. The plain HTTP server above
+            keeps running unchanged (nothing breaks for existing clients);
+            this just adds an encrypted option alongside it.
+
+            Needs a certificate + private key generated BEFORE building -
+            run tools/gen_https_cert.sh first (writes certs/server_cert.pem
+            and certs/server_key.pem, gitignored like sdkconfig - each
+            board gets its own, not a value shared across every build).
+            The build fails with a clear error if those files are missing
+            while this is enabled.
+
+    config HTTPS_API_PORT
+        int "HTTPS REST API port"
+        default 443
+        depends on HTTPS_API_ENABLE
+
+endmenu
+
 menu "HD-WF1 MQTT"
 
     config MQTT_BROKER_URI

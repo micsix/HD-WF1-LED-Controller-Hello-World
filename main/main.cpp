@@ -28,6 +28,14 @@
 #include "esp_netif_sntp.h"
 #include "esp_heap_caps.h"
 #include "esp_http_server.h"
+#if CONFIG_HTTPS_API_ENABLE
+#include "esp_https_server.h"
+#include "mbedtls/x509_crt.h"
+// ESP-IDF v6's mbedTLS (4.x) moved single-algorithm APIs like mbedtls_sha256() to a private header in favor of
+// the PSA Crypto API - psa_crypto_init() already runs automatically at boot (SECONDARY system init stage, see
+// components/mbedtls/port/esp_psa_crypto_init.c), so psa_hash_compute() can be called directly.
+#include "psa/crypto.h"
+#endif
 #include "esp_partition.h"
 #include <cstdarg>
 #include "esp_random.h"
@@ -1792,6 +1800,44 @@ bool http_authorized(httpd_req_t *req) {
   return diff == 0;
 }
 
+#if CONFIG_HTTPS_API_ENABLE
+// Embedded by main/CMakeLists.txt (EMBED_TXTFILES) from certs/server_cert.pem / server_key.pem - generated per
+// board by tools/gen_https_cert.sh, not committed (see Kconfig.projbuild's HTTPS API menu). EMBED_TXTFILES
+// appends a NUL, so cert_end - cert_start already includes it - exactly the length mbedTLS's PEM parser wants.
+extern const uint8_t server_cert_pem_start[] asm("_binary_server_cert_pem_start");
+extern const uint8_t server_cert_pem_end[] asm("_binary_server_cert_pem_end");
+extern const uint8_t server_key_pem_start[] asm("_binary_server_key_pem_start");
+extern const uint8_t server_key_pem_end[] asm("_binary_server_key_pem_end");
+
+// SHA-256 of the certificate's DER encoding (lowercase hex + NUL) - the standard X.509 fingerprint convention,
+// i.e. exactly what an Android TLS client computes from the certificate it receives during the handshake, so
+// the two are directly comparable for TOFU pinning. Computed once at boot by compute_https_cert_fingerprint();
+// empty until then (and if parsing ever fails, which http_api_init() treats as fatal to HTTPS startup).
+char https_cert_fingerprint_hex[65] = "";
+
+bool compute_https_cert_fingerprint() {
+  mbedtls_x509_crt crt;
+  mbedtls_x509_crt_init(&crt);
+  const int ret = mbedtls_x509_crt_parse(&crt, server_cert_pem_start,
+                                          static_cast<size_t>(server_cert_pem_end - server_cert_pem_start));
+  if (ret != 0) {
+    ESP_LOGE(HTTP_TAG, "failed to parse embedded HTTPS cert for fingerprint: -0x%04x", -ret);
+    mbedtls_x509_crt_free(&crt);
+    return false;
+  }
+  uint8_t hash[32];
+  size_t hash_len = 0;
+  const psa_status_t status = psa_hash_compute(PSA_ALG_SHA_256, crt.raw.p, crt.raw.len, hash, sizeof(hash), &hash_len);
+  mbedtls_x509_crt_free(&crt);
+  if (status != PSA_SUCCESS || hash_len != sizeof(hash)) {
+    ESP_LOGE(HTTP_TAG, "psa_hash_compute failed for HTTPS cert fingerprint: %d", static_cast<int>(status));
+    return false;
+  }
+  for (int i = 0; i < 32; i++) snprintf(https_cert_fingerprint_hex + i * 2, 3, "%02x", hash[i]);
+  return true;
+}
+#endif  // CONFIG_HTTPS_API_ENABLE
+
 esp_err_t http_send_json(httpd_req_t *req, const char *status, const char *json) {
   httpd_resp_set_status(req, status);
   httpd_resp_set_type(req, "application/json");
@@ -1902,13 +1948,45 @@ esp_err_t http_unsave_handler(httpd_req_t *req) {
 
 // GET /api/whoami - always at this fixed path, unauthenticated, so a client
 // can discover plaques on the LAN and learn the device ID needed for the
-// MAC-prefixed routes. Reveals nothing beyond the (broadcast) WiFi MAC.
+// MAC-prefixed routes. Reveals nothing beyond the (broadcast) WiFi MAC - and,
+// on an HTTPS-capable build, the HTTPS cert's fingerprint, which is public
+// information anyway (any TLS client sees it during the handshake); this
+// just lets a client learn it over plain HTTP first, for TOFU pinning before
+// ever making an HTTPS connection. See https_cert_fingerprint_hex below.
 esp_err_t http_whoami_handler(httpd_req_t *req) {
-  char json[96];
+  char json[192];
+#if CONFIG_HTTPS_API_ENABLE
+  snprintf(json, sizeof(json),
+           "{\"device\":\"hd-wf1-hub75\",\"device_id\":\"%s\",\"auth\":%s,\"https_port\":%d,\"tls_fingerprint\":\"%s\"}",
+           device_id_hex, strlen(CONFIG_HTTP_API_TOKEN) ? "true" : "false", CONFIG_HTTPS_API_PORT,
+           https_cert_fingerprint_hex);
+#else
   snprintf(json, sizeof(json), "{\"device\":\"hd-wf1-hub75\",\"device_id\":\"%s\",\"auth\":%s}", device_id_hex,
            strlen(CONFIG_HTTP_API_TOKEN) ? "true" : "false");
+#endif
   return http_send_json(req, "200 OK", json);
 }
+
+// Registers every route (command/status/info/save/unsave/whoami) on `server` - shared between the plain HTTP
+// server and the optional HTTPS one below, so the two stay in lockstep rather than needing every new route
+// added twice. http_command_prefix/http_status_path/etc. and command_pattern must already be set.
+void register_api_routes(httpd_handle_t server, const char *command_pattern) {
+  const httpd_uri_t command_post = {command_pattern, HTTP_POST, http_command_handler, nullptr};
+  const httpd_uri_t command_put = {command_pattern, HTTP_PUT, http_command_handler, nullptr};
+  const httpd_uri_t status_get = {http_status_path, HTTP_GET, http_status_handler, nullptr};
+  httpd_register_uri_handler(server, &command_post);
+  httpd_register_uri_handler(server, &command_put);
+  httpd_register_uri_handler(server, &status_get);
+  const httpd_uri_t info_get = {http_info_path, HTTP_GET, http_info_handler, nullptr};
+  httpd_register_uri_handler(server, &info_get);
+  const httpd_uri_t save_post = {http_save_path, HTTP_POST, http_save_handler, nullptr};
+  const httpd_uri_t unsave_post = {http_unsave_path, HTTP_POST, http_unsave_handler, nullptr};
+  httpd_register_uri_handler(server, &save_post);
+  httpd_register_uri_handler(server, &unsave_post);
+  const httpd_uri_t whoami_get = {"/api/whoami", HTTP_GET, http_whoami_handler, nullptr};
+  httpd_register_uri_handler(server, &whoami_get);
+}
+
 
 void http_api_init(void) {
 #if CONFIG_HTTP_API_ENABLE
@@ -1935,6 +2013,8 @@ void http_api_init(void) {
   strlcpy(http_save_path, "/api/save", sizeof(http_save_path));
   strlcpy(http_unsave_path, "/api/unsave", sizeof(http_unsave_path));
 #endif
+  char command_pattern[64];
+  snprintf(command_pattern, sizeof(command_pattern), "%s*", http_command_prefix);
 
   httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
   cfg.server_port = CONFIG_HTTP_API_PORT;
@@ -1948,27 +2028,41 @@ void http_api_init(void) {
     ESP_LOGE(HTTP_TAG, "httpd_start failed");
     return;
   }
-  char command_pattern[64];
-  snprintf(command_pattern, sizeof(command_pattern), "%s*", http_command_prefix);
   // httpd_register_uri_handler() strdup()s .uri immediately, so it's safe
-  // for command_pattern to go out of scope right after these calls.
-  const httpd_uri_t command_post = {command_pattern, HTTP_POST, http_command_handler, nullptr};
-  const httpd_uri_t command_put = {command_pattern, HTTP_PUT, http_command_handler, nullptr};
-  const httpd_uri_t status_get = {http_status_path, HTTP_GET, http_status_handler, nullptr};
-  httpd_register_uri_handler(server, &command_post);
-  httpd_register_uri_handler(server, &command_put);
-  httpd_register_uri_handler(server, &status_get);
-  const httpd_uri_t info_get = {http_info_path, HTTP_GET, http_info_handler, nullptr};
-  httpd_register_uri_handler(server, &info_get);
-  const httpd_uri_t save_post = {http_save_path, HTTP_POST, http_save_handler, nullptr};
-  const httpd_uri_t unsave_post = {http_unsave_path, HTTP_POST, http_unsave_handler, nullptr};
-  httpd_register_uri_handler(server, &save_post);
-  httpd_register_uri_handler(server, &unsave_post);
-  const httpd_uri_t whoami_get = {"/api/whoami", HTTP_GET, http_whoami_handler, nullptr};
-  httpd_register_uri_handler(server, &whoami_get);
+  // for command_pattern to go out of scope right after this call returns.
+  register_api_routes(server, command_pattern);
   ESP_LOGI(HTTP_TAG, "REST API listening on port %d, commands at %s*, status at %s%s", CONFIG_HTTP_API_PORT,
            http_command_prefix, http_status_path, strlen(CONFIG_HTTP_API_TOKEN) ? " (token required)" : " (NO AUTH)");
-#endif
+
+#if CONFIG_HTTPS_API_ENABLE
+  // Separate server instance on its own port, TLS only (see Kconfig.projbuild's HTTPS API menu for why this
+  // isn't offered on the HD-WF1/esp32s2 branch) - the plain HTTP server above is unaffected either way.
+  if (!compute_https_cert_fingerprint()) {
+    ESP_LOGE(HTTP_TAG, "HTTPS API not started: embedded certificate is invalid");
+  } else {
+    httpd_ssl_config_t ssl_cfg = HTTPD_SSL_CONFIG_DEFAULT();
+    ssl_cfg.httpd.uri_match_fn = httpd_uri_match_wildcard;
+    ssl_cfg.httpd.stack_size = 10240;  // TLS handshakes need more stack than the plain server's handlers
+    ssl_cfg.httpd.max_open_sockets = 2;  // ~40KB/socket (mbedTLS session + buffers) - see HTTPD_SSL_CONFIG_DEFAULT()
+    ssl_cfg.httpd.lru_purge_enable = true;
+    ssl_cfg.servercert = server_cert_pem_start;
+    ssl_cfg.servercert_len = static_cast<size_t>(server_cert_pem_end - server_cert_pem_start);
+    ssl_cfg.prvtkey_pem = server_key_pem_start;
+    ssl_cfg.prvtkey_len = static_cast<size_t>(server_key_pem_end - server_key_pem_start);
+    ssl_cfg.transport_mode = HTTPD_SSL_TRANSPORT_SECURE;
+    ssl_cfg.port_secure = CONFIG_HTTPS_API_PORT;
+
+    httpd_handle_t https_server = nullptr;
+    if (httpd_ssl_start(&https_server, &ssl_cfg) != ESP_OK) {
+      ESP_LOGE(HTTP_TAG, "httpd_ssl_start failed");
+    } else {
+      register_api_routes(https_server, command_pattern);
+      ESP_LOGI(HTTP_TAG, "HTTPS REST API listening on port %d (cert fingerprint %s)", CONFIG_HTTPS_API_PORT,
+               https_cert_fingerprint_hex);
+    }
+  }
+#endif  // CONFIG_HTTPS_API_ENABLE
+#endif  // CONFIG_HTTP_API_ENABLE
 }
 
 // Called by the SNTP client on every successful sync, whether from the
