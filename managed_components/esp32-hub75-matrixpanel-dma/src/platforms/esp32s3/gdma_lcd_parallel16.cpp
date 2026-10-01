@@ -224,6 +224,22 @@
 
 
     // Allocate DMA channel and connect it to the LCD peripheral
+    // IDF v6 patch (digital-address-plaque, see README "Vendored library patches are not durable"):
+    // gdma_channel_alloc_config_t dropped .sibling_chan/.direction/.flags.reserve_sibling (direction is now
+    // implied by which of ret_tx_chan/ret_rx_chan is non-NULL) and gdma_new_ahb_channel() gained a third
+    // (rx channel) out-param - this project only wants a TX channel, so that one is NULL. gdma_strategy_config_t
+    // also gained a required third field, eof_till_data_popped.
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 0, 0)
+    static gdma_channel_alloc_config_t dma_chan_config = {
+      .flags = {
+        .isr_cache_safe = 0
+      }
+    };
+    esp_err_t err = gdma_new_ahb_channel(&dma_chan_config, &dma_chan, NULL);
+    if (err != ESP_OK) {
+      ESP_LOGE("S3", "Failed to allocate AHB GDMA channel: %s", esp_err_to_name(err));
+    }
+#elif ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0)
     static gdma_channel_alloc_config_t dma_chan_config = {
       .sibling_chan = NULL,
       .direction = GDMA_CHANNEL_DIRECTION_TX,
@@ -231,19 +247,33 @@
         .reserve_sibling = 0
       }
     };
-#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0)
     esp_err_t err = gdma_new_ahb_channel(&dma_chan_config, &dma_chan);
     if (err != ESP_OK) {
       ESP_LOGE("S3", "Failed to allocate AHB GDMA channel: %s", esp_err_to_name(err));
     }
 #else
+    static gdma_channel_alloc_config_t dma_chan_config = {
+      .sibling_chan = NULL,
+      .direction = GDMA_CHANNEL_DIRECTION_TX,
+      .flags = {
+        .reserve_sibling = 0
+      }
+    };
     gdma_new_channel(&dma_chan_config, &dma_chan);
 #endif
     gdma_connect(dma_chan, GDMA_MAKE_TRIGGER(GDMA_TRIG_PERIPH_LCD, 0));
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 0, 0)
+    static gdma_strategy_config_t strategy_config = {
+      .owner_check = false,
+      .auto_update_desc = false,
+      .eof_till_data_popped = false
+    };
+#else
     static gdma_strategy_config_t strategy_config = {
       .owner_check = false,
       .auto_update_desc = false
     };
+#endif
     gdma_apply_strategy(dma_chan, &strategy_config);
 
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 3, 0) // gdma_transfer_config_t introduced in IDF 5.3

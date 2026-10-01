@@ -1,0 +1,19 @@
+# HD-WF2 = ESP32-S3, 8MB flash. Applied on top of sdkconfig.defaults (which
+# targets esp32s2/HD-WF1) when CONFIG_IDF_TARGET=esp32s3 - this is ESP-IDF's
+# standard per-target overlay mechanism, so the base file's esp32s2-specific
+# lines below are overridden here rather than edited in place.
+CONFIG_IDF_TARGET="esp32s3"
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+
+# Not yet known whether this specific board has PSRAM wired/populated -
+# leave it off for first bring-up (matches the HD-WF1 base's explicit `n`)
+# rather than guessing; S3's larger internal SRAM alone is the "more RAM"
+# this board offers for now. Revisit once that's confirmed.
+CONFIG_SPIRAM=n
+
+# ESP32-S3 has a native USB-Serial/JTAG peripheral (unlike the S2's
+# USB-OTG-only setup that this project's base config routes around - see
+# sdkconfig.defaults's console comments) - use it directly rather than
+# requiring a separate UART-TTL adapter.
+CONFIG_ESP_CONSOLE_UART_DEFAULT=n
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y

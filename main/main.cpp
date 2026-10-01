@@ -2050,6 +2050,29 @@ void network_init_task(void *arg) {
 // profiles - both panels used the same values for these in every commit this
 // project has ever built from - so they stay fixed #defines, shared by every
 // PanelProfile.
+// This project also builds for the Huidu HD-WF2 (ESP32-S3, more RAM, two
+// HUB75 ports) - selected by `idf.py set-target esp32s3` (a separate
+// sdkconfig/build dir from the HD-WF1's esp32s2 target, see README). The
+// WF1_* names below are kept as-is for minimal diff across the rest of this
+// file; on an esp32s3 build they hold the HD-WF2's values instead of the
+// HD-WF1's. Source for both: mrcodetastic/HD-WF1-WF2-LED-MatrixPanel-DMA,
+// src/hd-wf{1,2}-esp32s{2,3}-config.h.
+#if CONFIG_IDF_TARGET_ESP32S3
+// HD-WF2's 75EX1 HUB75 port (the other, 75EX2, can't be used at the same
+// time, and its E line is undocumented upstream, so only 75EX1 is supported
+// here). A/B/C/D/OE/CLK/LAT are shared between both ports on this board.
+#define WF1_A_PIN  39
+#define WF1_B_PIN  38
+#define WF1_C_PIN  37
+#define WF1_D_PIN  36
+#define WF1_E_PIN  21
+#define WF1_OE_PIN  35
+#define WF1_CLK_PIN 34
+#define WF1_LAT_PIN 33
+// Per community documentation - not yet confirmed against this physical
+// unit (same caveat as the HD-WF1 button pin below).
+#define WF1_BUTTON_PIN 17
+#else
 #define WF1_A_PIN  39
 #define WF1_B_PIN  38
 #define WF1_C_PIN  37
@@ -2065,6 +2088,7 @@ void network_init_task(void *arg) {
 // render loop: a short press reboots the board, a long press pings the
 // default gateway and blinks the lower-right pixel (see gateway_ping_task()).
 #define WF1_BUTTON_PIN 11
+#endif
 
 // One of two physical panels this firmware can drive - chosen by a
 // menuconfig choice (CONFIG_PANEL_RESOLUTION_128X64/64X32, see app_main()'s
@@ -2081,6 +2105,26 @@ struct PanelProfile {
   bool clkphase;
 };
 
+#if CONFIG_IDF_TARGET_ESP32S3
+// HD-WF2, 75EX1 port. Confirmed empirically on the physically-attached
+// 64x32 panel via hub75/red/green/blue: with the community reference's
+// naive source order (R=2/3, G=6/7, B=10/11) red correctly lit red, but
+// green lit BLUE and blue lit GREEN - i.e. G and B are swapped, R is not.
+// So G uses the pins that light green (10/11), B those that light blue
+// (6/7). clkphase is still an unverified guess, copied from the HD-WF1
+// 128x64 profile - no adjacent-pixel ghosting observed yet, but it hasn't
+// been deliberately tested either way.
+constexpr PanelProfile kProfile128x64 = {
+    "128x64 (HD-WF2 75EX1)", kPanelMaxWidth, kPanelMaxHeight,
+    /*r1*/2, /*g1*/10, /*b1*/6, /*r2*/3, /*g2*/11, /*b2*/7,
+    /*clkphase*/false,
+};
+constexpr PanelProfile kProfile64x32 = {
+    "64x32 (HD-WF2 75EX1)", 64, 32,
+    /*r1*/2, /*g1*/10, /*b1*/6, /*r2*/3, /*g2*/11, /*b2*/7,
+    /*clkphase*/false,
+};
+#else
 // Confirmed empirically on the current, physically-attached 128x64 panel via
 // direct hub75/1300L colours: with the naive source order (R=2/4, G=3/5,
 // B=6/8) red data lit BLUE LEDs, green data lit RED and blue data lit GREEN -
@@ -2108,6 +2152,7 @@ constexpr PanelProfile kProfile64x32 = {
     /*r1*/2, /*g1*/3, /*b1*/6, /*r2*/4, /*g2*/5, /*b2*/8,
     /*clkphase*/false,
 };
+#endif
 
 // The active profile's color-channel pins, set once by init_display() at
 // boot. Everything else profile-dependent (geometry) is tracked directly by

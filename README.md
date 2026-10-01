@@ -2,11 +2,17 @@
 
 ESP-IDF firmware that scrolls "Hello, world!" across a HUB75 RGB LED matrix
 panel connected to a **Huidu HD-WF1** control card (ESP32-S2, 4MB flash, no
-PSRAM, single HUB75E port).
+PSRAM, single HUB75E port) or a **Huidu HD-WF2** (ESP32-S3, 8MB flash, no
+PSRAM confirmed yet, much more internal SRAM, two HUB75E ports) - see
+[HD-WF2 (ESP32-S3) bring-up notes](#hd-wf2-esp32-s3-bring-up-notes).
 
-Builds and runs on **ESP-IDF v6.0.1** (also works, unmodified, on v5.4.1).
+Builds and runs on **ESP-IDF v6.0.1** (also works, unmodified, on v5.4.1,
+for the HD-WF1/esp32s2 target - HD-WF2/esp32s3 has only been built against
+v6.0.1).
 
 ## Quick start
+
+HD-WF1 (ESP32-S2):
 
 ```sh
 source ~/esp/esp-idf-v6.0.1/export.sh
@@ -21,10 +27,25 @@ To flash, the board must first be put into the ROM bootloader (see
 idf.py -p /dev/ttyACM1 flash
 ```
 
+HD-WF2 (ESP32-S3) - uses a **separate sdkconfig**, since the two targets
+aren't configuration-compatible (see [HD-WF2 bring-up
+notes](#hd-wf2-esp32-s3-bring-up-notes)):
+
+```sh
+source ~/esp/esp-idf-v6.0.1/export.sh
+idf.py -D SDKCONFIG=sdkconfig.esp32s3 -B build_esp32s3 set-target esp32s3
+# then copy WIFI_SSID/PASSWORD, NTP, HTTP API, MQTT, etc. from your sdkconfig
+# into sdkconfig.esp32s3 (menuconfig, or hand-edit - these aren't in
+# sdkconfig.defaults.esp32s3, which only covers target-level settings)
+idf.py -D SDKCONFIG=sdkconfig.esp32s3 -B build_esp32s3 -p /dev/ttyACM0 flash
+```
+
 ## Hardware
 
 - **Board**: Huidu HD-WF1 — ESP32-S2, HUB75E connector, RTC (BM8563), no
-  auto-reset circuit (see [Flashing](#flashing)).
+  auto-reset circuit (see [Flashing](#flashing)). Also builds for the
+  **Huidu HD-WF2** (ESP32-S3) - see [HD-WF2 (ESP32-S3) bring-up
+  notes](#hd-wf2-esp32-s3-bring-up-notes).
 - **Panel**: two physical panels are supported, selected by a menuconfig
   choice (*HD-WF1 Panel → Panel resolution*, default 128×64) - fixed at
   build time, reflash after changing it to drive the other panel. The
@@ -265,7 +286,7 @@ lowercase hex digits, e.g. `aabbccddeeff`:
 | `POST /api/<mac>/save` | – | Persists what the panel is showing (last content command + brightness) to flash; it is replayed on every boot, before WiFi is up. `409` if nothing has been shown yet. |
 | `POST /api/<mac>/unsave` | – | Forgets the saved display; boot behaves as before. |
 | `GET /api/whoami` | – | Fixed, unauthenticated path for LAN discovery: `{"device":"hd-wf1-hub75","device_id":"<mac>","auth":false}`. |
-| `GET /api/<mac>/info` | – | Static facts as JSON: `{"device_id":"...","width":128,"height":64,"full_effects":false,"version":"v2026.09.27.021"}`. |
+| `GET /api/<mac>/info` | – | Static facts as JSON: `{"device_id":"...","width":128,"height":64,"full_effects":false,"version":"v2026.09.30.022"}`. |
 
 Disable that setting for the legacy flat `/api/command/<name>` and
 `/api/status` paths (fine for a single board, or behind a reverse proxy that
@@ -517,6 +538,82 @@ memory problems. Kept here so they aren't rediscovered:
   are laid out with the font's advances, box-filtered to fill the 128×64 panel
   in linear coverage, and blended through the display library's CIE 1931
   lightness curve so edge pixels get the right weight.
+
+## HD-WF2 (ESP32-S3) bring-up notes
+
+A second physical board - a Huidu HD-WF2, with much more RAM than the
+HD-WF1 (hundreds of KB free heap vs. the HD-WF1's tens of KB headroom; see
+[128×64 bring-up notes](#12864-bring-up-notes) above) - was brought up
+against this same codebase. `main.cpp`'s pins and `PanelProfile`s are
+`#if CONFIG_IDF_TARGET_ESP32S3` branches alongside the HD-WF1's (`esp32s2`)
+ones; everything else (REST API, MQTT, effects, save/restore, ...) is
+unchanged and works identically on both.
+
+- **Separate sdkconfig required.** `esp32s2` and `esp32s3` sdkconfigs are
+  not interchangeable - `idf.py set-target esp32s3` regenerates one from
+  scratch. Use a distinct `-D SDKCONFIG=`/`-B` pair so this never shares a
+  config (or build dir) with an HD-WF1 build; see [Quick start](#quick-start).
+  `sdkconfig.defaults.esp32s3` (ESP-IDF's standard per-target overlay,
+  applied on top of the base `sdkconfig.defaults`) carries the esp32s3-only
+  settings: target, 8MB flash size, no PSRAM (unconfirmed either way on
+  this board - left off rather than guessed), and routing the console
+  through the native USB-Serial/JTAG peripheral instead of the HD-WF1's
+  UART workaround (see that bring-up note above - this board's native USB
+  console hasn't shown the same crash, though it also hasn't been stress
+  tested as hard).
+- **Two HUB75 ports, 75EX1 and 75EX2, can't be used at once** (shared
+  A/B/C/D/OE/CLK/LAT; only R/G/B/E differ per port) - only 75EX1 is
+  supported here, since 75EX2's E line is undocumented upstream and
+  therefore unimplemented. Pin source, same as the HD-WF1's:
+  `mrcodetastic/HD-WF1-WF2-LED-MatrixPanel-DMA`,
+  `src/hd-wf2-esp32s3-config.h`.
+
+  | Signal | 75EX1 GPIO |
+  |---|---|
+  | R1 / R2 | 2 / 3 |
+  | G1 / G2 | 10 / 11 |
+  | B1 / B2 | 6 / 7 |
+  | A / B / C / D / E | 39 / 38 / 37 / 36 / 21 |
+  | LAT / OE / CLK | 33 / 35 / 34 |
+  | Onboard button | 17 (per community docs, not yet confirmed) |
+
+  R/G/B above are already corrected (see next point) - this table is the
+  as-flashed values, not the community reference's naive ones.
+- **R/G/B empirically confirmed** on the physically-attached 64×32 panel,
+  the same way the HD-WF1 panels were: the community reference's naive
+  order (R=2/3, G=6/7, B=10/11) got red right but swapped green and blue -
+  green data lit blue LEDs and vice versa. Fixed by swapping G and B's pins
+  (G=10/11, B=6/7); R unchanged. `clkphase` is **not yet verified** either
+  way (still `false`, copied from the HD-WF1 128×64 profile as a starting
+  guess) - no ghosting observed, but it hasn't been deliberately tested
+  with `hub75/test1` the way the HD-WF1's was.
+- **No manual pad-bridging needed to flash** - unlike the HD-WF1 (see
+  [Flashing](#flashing)), this board's native USB-Serial/JTAG peripheral
+  handles auto-reset into the ROM bootloader on its own, the normal way
+  `esptool`/`idf.py flash` expects.
+- **That auto-reset circuit is touchy, though.** Opening the serial port
+  (even just to read console output) can leave the board latched in the
+  ROM bootloader ("waiting for download") instead of booting normally -
+  `esptool --before no-reset --after no-reset read-mac` connecting
+  successfully with no prior bootloader-entry step is the tell. A software
+  reset (`esptool ... --after hard-reset ...`) doesn't reliably clear this;
+  a full power cycle (unplug/replug) does. `esp_reset_reason()` reports
+  `11` (`ESP_RST_USB`) after a reset caused by this peripheral - expected
+  and benign after a flash, not a fault code like `4` (panic) or `9`
+  (brownout).
+- **Vendored library patch** (see [Vendored library patches are not
+  durable](#️-vendored-library-patches-are-not-durable) above):
+  `managed_components/esp32-hub75-matrixpanel-dma/src/platforms/esp32s3/gdma_lcd_parallel16.cpp`
+  needed an IDF v6 patch of its own, separate from the generic one already
+  documented there - the ESP32-S3-specific GDMA backend predates IDF v6's
+  GDMA API changes (`gdma_new_ahb_channel()` gained a third, RX-channel
+  out-param; `gdma_channel_alloc_config_t` dropped `.sibling_chan`/
+  `.direction`/`.flags.reserve_sibling` in favor of implying direction from
+  which out-param is non-NULL; `gdma_strategy_config_t` gained a required
+  `eof_till_data_popped` field). Patched with a version-gated
+  `#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 0, 0)` branch alongside the
+  existing ones, so older-IDF builds of this same vendored file are
+  unaffected.
 
 ## Root cause history
 
