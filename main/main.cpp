@@ -2208,9 +2208,13 @@ struct PanelProfile {
 // (6/7). clkphase is still an unverified guess, copied from the HD-WF1
 // 128x64 profile - no adjacent-pixel ghosting observed yet, but it hasn't
 // been deliberately tested either way.
+// The 128x64 panel is wired differently from the 64x32 one: confirmed on
+// the physically-attached 128x64 panel, the 64x32 mapping above showed
+// red->blue, green->red, blue->green. So R uses the pins that light red
+// (10/11), G those that light green (6/7), B those that light blue (2/3).
 constexpr PanelProfile kProfile128x64 = {
     "128x64 (HD-WF2 75EX1)", kPanelMaxWidth, kPanelMaxHeight,
-    /*r1*/2, /*g1*/10, /*b1*/6, /*r2*/3, /*g2*/11, /*b2*/7,
+    /*r1*/10, /*g1*/6, /*b1*/2, /*r2*/11, /*g2*/7, /*b2*/3,
     /*clkphase*/false,
 };
 constexpr PanelProfile kProfile64x32 = {

@@ -1,4 +1,4 @@
 cmake_minimum_required(VERSION 3.16)
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
-set(PROJECT_VER "v2026.09.30.023")
+set(PROJECT_VER "v2026.10.10.024")
 project(hub75_hello)

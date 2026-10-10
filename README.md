@@ -286,7 +286,7 @@ lowercase hex digits, e.g. `aabbccddeeff`:
 | `POST /api/<mac>/save` | – | Persists what the panel is showing (last content command + brightness) to flash; it is replayed on every boot, before WiFi is up. `409` if nothing has been shown yet. |
 | `POST /api/<mac>/unsave` | – | Forgets the saved display; boot behaves as before. |
 | `GET /api/whoami` | – | Fixed, unauthenticated path for LAN discovery: `{"device":"hd-wf1-hub75","device_id":"<mac>","auth":false}` - plus `"https_port"`/`"tls_fingerprint"` on an HTTPS-enabled build (hd-wf2 branch only, see [HTTPS](#https-hd-wf2-branch-only) below). |
-| `GET /api/<mac>/info` | – | Static facts as JSON: `{"device_id":"...","width":128,"height":64,"full_effects":false,"version":"v2026.09.30.023"}`. |
+| `GET /api/<mac>/info` | – | Static facts as JSON: `{"device_id":"...","width":128,"height":64,"full_effects":false,"version":"v2026.10.10.024"}`. |
 
 Disable that setting for the legacy flat `/api/command/<name>` and
 `/api/status` paths (fine for a single board, or behind a reverse proxy that
