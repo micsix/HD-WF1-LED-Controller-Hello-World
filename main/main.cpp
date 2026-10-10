@@ -9,6 +9,7 @@
 #define HUB75_FULL_EFFECTS 0
 #endif
 
+#include <algorithm>
 #include <cctype>
 #include <cerrno>
 #include <cmath>
@@ -36,6 +37,7 @@
 // components/mbedtls/port/esp_psa_crypto_init.c), so psa_hash_compute() can be called directly.
 #include "psa/crypto.h"
 #endif
+#include "esp_ota_ops.h"
 #include "esp_partition.h"
 #include <cstdarg>
 #include "esp_random.h"
@@ -1786,6 +1788,7 @@ char http_status_path[32] = "/api/status";
 char http_info_path[32] = "/api/info";
 char http_save_path[32] = "/api/save";
 char http_unsave_path[32] = "/api/unsave";
+char http_ota_path[32] = "/api/ota";
 
 bool http_authorized(httpd_req_t *req) {
   if (strlen(CONFIG_HTTP_API_TOKEN) == 0) return true;
@@ -1946,6 +1949,78 @@ esp_err_t http_unsave_handler(httpd_req_t *req) {
   return http_send_json(req, "200 OK", "{\"ok\":true}");
 }
 
+// POST .../ota - body is the raw app binary (build/hub75_hello.bin), written to the inactive OTA slot; on
+// success the boot partition is switched and the board reboots into it. The new image is only kept if it then
+// calls esp_ota_mark_app_valid_cancel_rollback() (network_init_task, ~30s after boot) - otherwise the bootloader
+// rolls back to the previous slot. Requires a bearer token to be configured: unauthenticated firmware upload
+// would be remote code execution, so an open (no-token) API refuses it. Needs the OTA partition table
+// (partitions_esp32s3.csv); on a single-slot build it answers 501. The render loop keeps running during the
+// upload, so the display stays as it was.
+esp_err_t http_ota_handler(httpd_req_t *req) {
+  if (strlen(CONFIG_HTTP_API_TOKEN) == 0) {
+    return http_send_json(req, "403 Forbidden", "{\"ok\":false,\"error\":\"OTA requires CONFIG_HTTP_API_TOKEN\"}");
+  }
+  if (!http_authorized(req)) {
+    httpd_resp_set_hdr(req, "WWW-Authenticate", "Bearer");
+    return http_send_json(req, "401 Unauthorized", "{\"ok\":false,\"error\":\"unauthorized\"}");
+  }
+  const esp_partition_t *slot = esp_ota_get_next_update_partition(nullptr);
+  if (slot == nullptr || esp_ota_get_running_partition()->subtype == ESP_PARTITION_SUBTYPE_APP_FACTORY) {
+    return http_send_json(req, "501 Not Implemented", "{\"ok\":false,\"error\":\"no OTA partitions in this build\"}");
+  }
+  const size_t total = req->content_len;
+  if (total == 0 || total > slot->size) {
+    return http_send_json(req, "400 Bad Request", "{\"ok\":false,\"error\":\"bad or missing Content-Length\"}");
+  }
+  static bool ota_in_progress = false;
+  if (ota_in_progress) {
+    return http_send_json(req, "409 Conflict", "{\"ok\":false,\"error\":\"OTA already in progress\"}");
+  }
+  ota_in_progress = true;
+
+  constexpr size_t kChunk = 2048;
+  uint8_t *buf = static_cast<uint8_t *>(malloc(kChunk));
+  esp_ota_handle_t handle = 0;
+  const char *err = nullptr;
+  if (buf == nullptr) {
+    err = "out of memory";
+  } else if (esp_ota_begin(slot, total, &handle) != ESP_OK) {
+    err = "esp_ota_begin failed";
+  } else {
+    ESP_LOGI(HTTP_TAG, "OTA: receiving %u bytes into %s", static_cast<unsigned>(total), slot->label);
+    size_t got = 0;
+    while (got < total) {
+      const int r = httpd_req_recv(req, reinterpret_cast<char *>(buf), std::min(kChunk, total - got));
+      if (r == HTTPD_SOCK_ERR_TIMEOUT) continue;
+      if (r <= 0) {
+        err = "connection lost during upload";
+        break;
+      }
+      if (esp_ota_write(handle, buf, static_cast<size_t>(r)) != ESP_OK) {
+        err = "flash write failed";
+        break;
+      }
+      got += static_cast<size_t>(r);
+    }
+    if (err == nullptr && esp_ota_end(handle) != ESP_OK) err = "image validation failed";
+    if (err != nullptr && handle != 0 && got < total) esp_ota_abort(handle);
+    if (err == nullptr && esp_ota_set_boot_partition(slot) != ESP_OK) err = "set boot partition failed";
+  }
+  free(buf);
+  ota_in_progress = false;
+  if (err != nullptr) {
+    ESP_LOGE(HTTP_TAG, "OTA failed: %s", err);
+    char json[96];
+    snprintf(json, sizeof(json), "{\"ok\":false,\"error\":\"%s\"}", err);
+    return http_send_json(req, "500 Internal Server Error", json);
+  }
+  ESP_LOGI(HTTP_TAG, "OTA complete, rebooting into %s", slot->label);
+  http_send_json(req, "200 OK", "{\"ok\":true,\"rebooting\":true}");
+  vTaskDelay(pdMS_TO_TICKS(1000));  // let the response flush
+  esp_restart();
+  return ESP_OK;
+}
+
 // GET /api/whoami - always at this fixed path, unauthenticated, so a client
 // can discover plaques on the LAN and learn the device ID needed for the
 // MAC-prefixed routes. Reveals nothing beyond the (broadcast) WiFi MAC - and,
@@ -1983,6 +2058,8 @@ void register_api_routes(httpd_handle_t server, const char *command_pattern) {
   const httpd_uri_t unsave_post = {http_unsave_path, HTTP_POST, http_unsave_handler, nullptr};
   httpd_register_uri_handler(server, &save_post);
   httpd_register_uri_handler(server, &unsave_post);
+  const httpd_uri_t ota_post = {http_ota_path, HTTP_POST, http_ota_handler, nullptr};
+  httpd_register_uri_handler(server, &ota_post);
   const httpd_uri_t whoami_get = {"/api/whoami", HTTP_GET, http_whoami_handler, nullptr};
   httpd_register_uri_handler(server, &whoami_get);
 }
@@ -2006,12 +2083,14 @@ void http_api_init(void) {
   snprintf(http_info_path, sizeof(http_info_path), "/api/%s/info", device_id_hex);
   snprintf(http_save_path, sizeof(http_save_path), "/api/%s/save", device_id_hex);
   snprintf(http_unsave_path, sizeof(http_unsave_path), "/api/%s/unsave", device_id_hex);
+  snprintf(http_ota_path, sizeof(http_ota_path), "/api/%s/ota", device_id_hex);
 #else
   strlcpy(http_command_prefix, "/api/command/", sizeof(http_command_prefix));
   strlcpy(http_status_path, "/api/status", sizeof(http_status_path));
   strlcpy(http_info_path, "/api/info", sizeof(http_info_path));
   strlcpy(http_save_path, "/api/save", sizeof(http_save_path));
   strlcpy(http_unsave_path, "/api/unsave", sizeof(http_unsave_path));
+  strlcpy(http_ota_path, "/api/ota", sizeof(http_ota_path));
 #endif
   char command_pattern[64];
   snprintf(command_pattern, sizeof(command_pattern), "%s*", http_command_prefix);
@@ -2133,6 +2212,10 @@ void network_init_task(void *arg) {
   ntp_init();
   mqtt_init();
   http_api_init();
+  // Confirm this image is good (see http_ota_handler) once it has survived 30s with WiFi/MQTT/HTTP up; a
+  // no-op on a build without rollback support or an image that's already valid.
+  vTaskDelay(pdMS_TO_TICKS(30000));
+  esp_ota_mark_app_valid_cancel_rollback();
   vTaskDelete(nullptr);
 }
 

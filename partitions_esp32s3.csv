@@ -1,0 +1,13 @@
+# HD-WF2 (ESP32-S3, 8MB flash) layout with OTA: two app slots + otadata.
+# Selected by sdkconfig.defaults.esp32s3. The first OTA-capable build must be
+# flashed over USB (the layout changes); later updates can go over the REST
+# API's POST .../ota endpoint. The HD-WF1 (esp32s2, 4MB) still uses
+# partitions.csv (single factory slot).
+# Name,   Type, SubType, Offset,   Size, Flags
+nvs,      data, nvs,     0x9000,   0x6000,
+phy_init, data, phy,     0xf000,   0x1000,
+otadata,  data, ota,     0x10000,  0x2000,
+ota_0,    app,  ota_0,   0x20000,  0x180000,
+ota_1,    app,  ota_1,   0x1A0000, 0x180000,
+coredump, data, coredump,0x320000, 64K,
+applog,   data, 0x40,    0x330000, 64K,

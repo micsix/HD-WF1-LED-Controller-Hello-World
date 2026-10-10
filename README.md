@@ -285,8 +285,9 @@ lowercase hex digits, e.g. `aabbccddeeff`:
 | `GET /api/<mac>/status` | – | Current state as JSON. |
 | `POST /api/<mac>/save` | – | Persists what the panel is showing (last content command + brightness) to flash; it is replayed on every boot, before WiFi is up. `409` if nothing has been shown yet. |
 | `POST /api/<mac>/unsave` | – | Forgets the saved display; boot behaves as before. |
+| `POST /api/<mac>/ota` | raw firmware binary (`build_esp32s3/hub75_hello.bin`) as the body | **HD-WF2 only** (OTA partition table `partitions_esp32s3.csv`; the HD-WF1 build answers 501). Writes the image to the inactive OTA slot, switches the boot partition and reboots. Requires `CONFIG_HTTP_API_TOKEN` to be set (refused with 403 otherwise). The new image must stay up ~30s to confirm itself, else the bootloader rolls back to the previous slot. Example: `curl -k -X POST -H "Authorization: Bearer <token>" --data-binary @build_esp32s3/hub75_hello.bin https://<device-ip>:<https-port>/api/<mac>/ota`. The first OTA-capable build must be flashed over USB (flash layout changed; applog is now at 0x330000, coredump 0x320000). |
 | `GET /api/whoami` | – | Fixed, unauthenticated path for LAN discovery: `{"device":"hd-wf1-hub75","device_id":"<mac>","auth":false}` - plus `"https_port"`/`"tls_fingerprint"` on an HTTPS-enabled build (hd-wf2 branch only, see [HTTPS](#https-hd-wf2-branch-only) below). |
-| `GET /api/<mac>/info` | – | Static facts as JSON: `{"device_id":"...","width":128,"height":64,"full_effects":false,"version":"v2026.10.10.025"}`. |
+| `GET /api/<mac>/info` | – | Static facts as JSON: `{"device_id":"...","width":128,"height":64,"full_effects":false,"version":"v2026.10.10.026"}`. |
 
 Disable that setting for the legacy flat `/api/command/<name>` and
 `/api/status` paths (fine for a single board, or behind a reverse proxy that

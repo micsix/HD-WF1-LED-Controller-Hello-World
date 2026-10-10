@@ -17,3 +17,10 @@ CONFIG_SPIRAM=n
 # requiring a separate UART-TTL adapter.
 CONFIG_ESP_CONSOLE_UART_DEFAULT=n
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# OTA: two app slots (partitions_esp32s3.csv) and bootloader rollback, so a
+# new image that never calls esp_ota_mark_app_valid_cancel_rollback() (see
+# network_init_task) is reverted to the previous slot on the next reset.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_esp32s3.csv"
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
