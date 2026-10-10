@@ -2067,7 +2067,7 @@ void http_api_init(void) {
 
 // Called by the SNTP client on every successful sync, whether from the
 // automatic sync kicked off by ntp_init() once WiFi connects, the periodic
-// background resync (every 5 minutes - see CONFIG_LWIP_SNTP_UPDATE_DELAY),
+// background resync (every 24 hours - see CONFIG_LWIP_SNTP_UPDATE_DELAY),
 // or a hub75/ntpset-triggered resync. Only takes over the display (the "TIME
 // SET" confirmation, then the live clock - see DisplayMode::kClockConfirm in
 // the render loop) when this sync was explicitly requested via hub75/ntpset;
@@ -2076,8 +2076,13 @@ void http_api_init(void) {
 void ntp_sync_cb(struct timeval *tv) {
   (void)tv;
   xSemaphoreTake(display_mutex, portMAX_DELAY);
+  // Only the first sync after boot and an explicit hub75/ntpset blink the corner pixel. The blink's end
+  // forces a full repaint, so blinking on the periodic background resyncs made the display visibly
+  // re-paint itself - it must stay static.
+  if (!ntp_synced || ntp_manual_resync_requested) {
+    ntp_blink_end_us = esp_timer_get_time() + 4000000;
+  }
   ntp_synced = true;
-  ntp_blink_end_us = esp_timer_get_time() + 4000000;  // confirm the sync: blink the corner pixel ~4s
   if (ntp_manual_resync_requested) {
     display_mode = DisplayMode::kClockConfirm;
     ntp_manual_resync_requested = false;  // consumed

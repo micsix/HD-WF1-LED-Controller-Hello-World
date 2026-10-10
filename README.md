@@ -286,7 +286,7 @@ lowercase hex digits, e.g. `aabbccddeeff`:
 | `POST /api/<mac>/save` | – | Persists what the panel is showing (last content command + brightness) to flash; it is replayed on every boot, before WiFi is up. `409` if nothing has been shown yet. |
 | `POST /api/<mac>/unsave` | – | Forgets the saved display; boot behaves as before. |
 | `GET /api/whoami` | – | Fixed, unauthenticated path for LAN discovery: `{"device":"hd-wf1-hub75","device_id":"<mac>","auth":false}` - plus `"https_port"`/`"tls_fingerprint"` on an HTTPS-enabled build (hd-wf2 branch only, see [HTTPS](#https-hd-wf2-branch-only) below). |
-| `GET /api/<mac>/info` | – | Static facts as JSON: `{"device_id":"...","width":128,"height":64,"full_effects":false,"version":"v2026.10.10.024"}`. |
+| `GET /api/<mac>/info` | – | Static facts as JSON: `{"device_id":"...","width":128,"height":64,"full_effects":false,"version":"v2026.10.10.025"}`. |
 
 Disable that setting for the legacy flat `/api/command/<name>` and
 `/api/status` paths (fine for a single board, or behind a reverse proxy that
@@ -449,7 +449,7 @@ router's client list.
 | `hub75/clock.eastern.blue` | any | Clock in US Eastern time (EST/EDT, auto-DST) - e.g. New York, blue digits. |
 | `hub75/clock.IST.blue` | any | Clock in India Standard Time (fixed UTC+5:30, no DST), blue digits. |
 | `hub75/clock.utc.green` | any | Clock in UTC, green digits. |
-| `hub75/ntpset` | any | Forces an immediate NTP resync and shows a "TIME SET" confirmation for ~3s before switching to (or returning to) `hub75/clock` in whatever zone/color was last selected. The automatic sync on boot and the periodic background resync every 5 minutes (see 'HD-WF1 NTP' in menuconfig) also keep the clock accurate, but do so silently - they never take over the display, so they don't interrupt whatever else is currently showing (e.g. `hub75/ping1`). |
+| `hub75/ntpset` | any | Forces an immediate NTP resync and shows a "TIME SET" confirmation for ~3s before switching to (or returning to) `hub75/clock` in whatever zone/color was last selected. The automatic sync on boot and the periodic background resync every 24 hours (see 'HD-WF1 NTP' in menuconfig) also keep the clock accurate, but do so silently - they never take over the display, so they don't interrupt whatever else is currently showing (e.g. `hub75/ping1`). |
 
 `hub75/test1`/`test2`/`test3`/`off`/`1300`/`1300a`/`1300b`/`1300c`/`1300d`/`1300e`/`1300f`/`1300L`/`1300LI`/`nn`-`nnnnnn`[`L`]/`13`/`00`/`pong`/`tictactoe`/`matrix`/`shootingstars`/`time`/`maze1`/`maze2`/`maze3`/`maze4`/`maze5`/`ping1`/`ping2`/solid-colors/`hub75/0`/`hub75/2`/`hub75/2L`/`hub75/2LL`/`hub75/clock`(`.*`)
 all replace whatever was showing (WiFi status or a previous message/pattern)

@@ -43,11 +43,11 @@ CONFIG_ESP_COREDUMP_CHECK_BOOT=y
 
 # hub75/clock + hub75/ntpset support up to two configured NTP servers
 CONFIG_LWIP_SNTP_MAX_SERVERS=2
-# Periodic background resync every 5 minutes (lwip's built-in SNTP periodic
-# mode, started automatically by esp_netif_sntp_init()'s default config.start
-# = true) - each resync re-fires ntp_sync_cb(), so the "TIME SET" confirmation
-# reappears every 5 minutes too, not just on the initial sync/hub75/ntpset.
-CONFIG_LWIP_SNTP_UPDATE_DELAY=300000
+# Periodic background resync once every 24 hours (lwip's built-in SNTP
+# periodic mode). Kept rare and silent: ntp_sync_cb() only blinks the corner
+# pixel (whose end forces a full repaint) for the first sync and hub75/ntpset,
+# so the display stays static. It used to be 5 minutes, which repainted it.
+CONFIG_LWIP_SNTP_UPDATE_DELAY=86400000
 
 # Console on UART, not the ROM USB CDC: at 128x64 the display DMA setup
 # coincides with a crash in esp_usb_console_interrupt (ROM USB ISR), which
